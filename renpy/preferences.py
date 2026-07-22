@@ -157,6 +157,11 @@ Preference("performance_test", True)
 # The language we use for translations.
 Preference("language", None, (str, type(None)))
 
+# Per-category language overrides. When set to None, falls back to language.
+Preference("image_language", None, (str, type(None)))
+Preference("text_language", None, (str, type(None)))
+Preference("voice_language", None, (str, type(None)))
+
 # Should we self-voice?
 Preference("self_voicing", False, (bool, str, type(None)))
 
@@ -263,6 +268,9 @@ class Preferences(renpy.object.Object):
         renderer = "auto"
         performance_test = True
         language = None
+        image_language = None
+        text_language = None
+        voice_language = None
         self_voicing = False
         self_voicing_volume_drop = 0.5
         emphasize_audio = False

@@ -53,7 +53,7 @@ def movie_stop(clear=True, only_fullscreen=False):
     if (not fullscreen) and only_fullscreen:
         return
 
-    renpy.audio.music.stop(channel="movie")
+    renpy.audio.music.stop(channel="movie", fadeout=0)
 
 
 def movie_start(filename, size=None, loops=0):
@@ -146,6 +146,18 @@ def interact():
                 break
         else:
             fullscreen = True
+
+            # When a movie reaches its natural end (EOF with nothing
+            # queued), the C layer sets playing_at_end=1 but keeps
+            # playing_name set. This means get_playing() never returns
+            # None, and SoundStopBehavior never fires. We detect this
+            # via the playing_at_end flag and stop the movie to allow
+            # the interaction to terminate.
+            if fullscreen and renpy.audio.music.channel_defined("movie"):
+                c = renpy.audio.audio.get_channel("movie")
+                if c.playing_at_end():
+                    movie_stop(clear=True)
+                    fullscreen = False
 
     else:
         fullscreen = False

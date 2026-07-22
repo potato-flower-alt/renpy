@@ -1,4 +1,4 @@
-﻿# Copyright 2004-2026 Tom Rothamel <pytom@bishoujo.us>
+# Copyright 2004-2026 Tom Rothamel <pytom@bishoujo.us>
 #
 # Permission is hereby granted, free of charge, to any person
 # obtaining a copy of this software and associated documentation files
@@ -47,7 +47,7 @@ init -1 python hide:
     # This controls the title of the window, when Ren'Py is
     # running in a window.
 
-    config.window_title = u"Ren'Py Launcher"
+    config.window_title = u"Ren'Py Launcher ★ Custom Build"
 
     # These control the name and version of the game, that are reported
     # with tracebacks and other debugging logs.

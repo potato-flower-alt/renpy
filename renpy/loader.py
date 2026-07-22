@@ -42,6 +42,7 @@ from renpy.webloader import DownloadNeeded
 # to look up filenames.
 "".encode("utf-8")
 
+
 # Physical Paths
 
 
@@ -137,6 +138,62 @@ class ArchiveHandlers:
 
 # A list containing archive handlers.
 archive_handlers = ArchiveHandlers()
+
+
+class RPAEv2ArchiveHandler(object):
+    """
+    Archive handler handling RPAE-2.0 AES-256-CTR encrypted archives.
+
+    The AES key is never stored in game scripts or build metadata. The
+    XOR key and index nonce are derived deterministically from the AES key
+    and archive name via HMAC-SHA256, ensuring reproducible builds.
+
+    The 12-byte index nonce is stored at fixed offset 40 in the archive.
+    """
+
+    archive_extension = ".rpa"
+
+    @staticmethod
+    def get_supported_extensions():
+        return [".rpa"]
+
+    @staticmethod
+    def get_supported_headers():
+        return [b"RPAE-2.0"]
+
+    @staticmethod
+    def read_index(infile):
+        import renpy.aescrypt as aescrypt
+
+        l = infile.read(40)
+        offset = int(l[9:25], 16)
+        key = int(l[26:34], 16)
+
+        infile.seek(40)
+        index_nonce = infile.read(12)
+
+        infile.seek(offset)
+        encrypted_index = infile.read()
+
+        index_data = aescrypt.decrypt_block(
+            index_nonce, 0, encrypted_index
+        )
+
+        index = loads(zlib.decompress(index_data))
+
+        for k in index.keys():
+            new_entries = []
+            for entry in index[k]:
+                offset_val = entry[0] ^ key
+                dlen_val = entry[1] ^ key
+                nonce = entry[2]
+                new_entries.append((offset_val, dlen_val, nonce))
+            index[k] = new_entries
+
+        return index
+
+
+archive_handlers.append(RPAEv2ArchiveHandler)
 
 
 class RPAv3ArchiveHandler(object):
@@ -281,6 +338,7 @@ def index_archives():
                 break
 
         renpy.config.archives.append(stem)
+
 
 
 def walkdir(path, elide=None):
@@ -574,7 +632,9 @@ file_open_callbacks.append(load_from_filesystem)
 def load_from_archive(name):
     """
     Returns an open python file object of the given type from an archive file.
+    Supports unencrypted (RPA-3.0, RPA-2.0, RPAv1) and encrypted (RPAE-2.0) archives.
     """
+
     for afn, index in archives:
         if not name in index:
             continue
@@ -588,7 +648,21 @@ def load_from_archive(name):
                 offset, dlen = t
                 start = b""
             else:
-                offset, dlen, start = t
+                offset, dlen, start_or_nonce = t
+
+                if isinstance(start_or_nonce, bytes) and len(start_or_nonce) == 12:
+                    nonce = start_or_nonce
+                    rv = AESDecryptingReader(afn, offset, dlen, nonce)
+                    buf = bytearray(dlen)
+                    n = rv.readinto(buf)
+                    rv._real_close()
+                    result = io.BytesIO(bytes(memoryview(buf)[:n]))
+                    if name.endswith(('.rpyc', '.rpy')):
+                        import renpy.aescrypt as aescrypt
+                        aescrypt.register_trusted_script(name)
+                    return result
+
+                start = start_or_nonce
 
             if start == None or len(start) == 0:
                 rv = RWopsIO(afn, "rb", base=offset, length=dlen)
@@ -612,6 +686,104 @@ def load_from_archive(name):
 
 
 file_open_callbacks.append(load_from_archive)
+
+
+class AESDecryptingReader(io.RawIOBase):
+    """
+    A file-like reader that decrypts AES-256-CTR encrypted data on-the-fly.
+
+    Reads ciphertext from the specified offset within an RPAE-2.0 archive file,
+    decrypts it, and returns plaintext. Supports seek/read/tell
+    operations for random access.
+    """
+
+    def __init__(self, archive_path, offset, length, nonce):
+        super().__init__()
+        self.archive_path = archive_path
+        self.offset = offset
+        self.length = length
+        self.nonce = nonce
+        self.pos = 0
+        self._file = open(archive_path, "rb")
+        self._closed_by_buffered = False
+
+    def readable(self):
+        return True
+
+    def seekable(self):
+        return True
+
+    def tell(self):
+        return self.pos
+
+    def seek(self, offset, whence=0):
+        if whence == 0:      # SEEK_SET
+            self.pos = offset
+        elif whence == 1:    # SEEK_CUR
+            self.pos += offset
+        elif whence == 2:    # SEEK_END
+            self.pos = self.length + offset
+
+        self.pos = max(0, min(self.pos, self.length))
+        return self.pos
+
+    def readinto(self, b):
+        import renpy.aescrypt as aescrypt
+
+        if self._file is None:
+            return 0
+
+        remaining = self.length - self.pos
+        if remaining <= 0:
+            return 0
+
+
+        to_read = min(len(b), remaining)
+
+        self._file.seek(self.offset + self.pos)
+        mv = memoryview(b)[:to_read]
+        n = self._file.readinto(mv)
+
+        if not n:
+            return 0
+
+        if self.pos == 0:
+            aescrypt.decrypt_file_inplace(self.nonce, memoryview(b)[:n])
+        else:
+            plaintext = aescrypt.decrypt_block(
+                self.nonce, self.pos, bytes(mv[:n])
+            )
+            b[:len(plaintext)] = plaintext
+
+        self.pos += n
+
+
+        return n
+
+    def close(self):
+        # Intercept close(). io.BufferedReader calls close() on the underlying
+        # stream when it is destroyed, but for audio/video async background
+        # reads, the C thread may still need the file descriptor. We defer the
+        # actual FD release and just mark that a buffered-layer close happened.
+        self._closed_by_buffered = True
+
+    def _real_close(self):
+        """Actually release the underlying file descriptor."""
+        if self._file is not None:
+            try:
+                self._file.close()
+            except Exception:
+                pass
+            self._file = None
+        try:
+            super().close()
+        except Exception:
+            pass
+
+    def __del__(self):
+        # Safety net: release FD if _real_close was never called.
+        self._real_close()
+
 
 
 def load_from_apk(name):
@@ -666,15 +838,18 @@ def check_name(name):
             raise Exception("Filenames may not contain relative directories like '.' and '..': %r" % name)
 
 
-def get_prefixes(tl=True, directory=None):
+def get_prefixes(tl=True, directory=None, name=None):
     """
     Returns a list of prefixes to search for files.
+
+    `name` is the filename being loaded, used for extension-based language
+    detection (image vs audio vs text).
     """
 
     rv = []
 
     if tl:
-        language = renpy.game.preferences.language  # type: ignore
+        language = renpy.translation.get_language_for_file(name=name, directory=directory)
     else:
         language = None
 
@@ -709,7 +884,7 @@ def load(name, directory=None, tl=True):
         name = name.replace("//", "/")
     name = name.lstrip("/")
 
-    for p in get_prefixes(directory=directory, tl=tl):
+    for p in get_prefixes(directory=directory, tl=tl, name=name):
         rv = load_core(p + name)
         if rv is not None:
             return rv
@@ -761,7 +936,7 @@ def loadable(name, tl=True, directory=None):
     if (renpy.config.loadable_callback is not None) and renpy.config.loadable_callback(name):
         return True
 
-    for p in get_prefixes(tl=tl, directory=directory):
+    for p in get_prefixes(tl=tl, directory=directory, name=name):
         if loadable_core(p + name):
             return True
 

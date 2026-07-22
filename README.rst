@@ -4,6 +4,14 @@ The Ren'Py Visual Novel Engine
 
 https://www.renpy.org
 
+Public Fork
+===========
+
+This branch contains additional archive encryption, media, rendering,
+fullscreen, and resource-language changes. Start with `FORK_NOTES.md
+<FORK_NOTES.md>`_ and `SECURITY_BUILD.md <SECURITY_BUILD.md>`_. The public
+tree contains no build key or generated integrity hashes.
+
 
 Branches
 ========

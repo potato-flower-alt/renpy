@@ -310,8 +310,20 @@ class Cache:
         # Otherwise, we load the image ourselves.
         if ce is None:
             if not predict:
-                with renpy.game.ExceptionInfo(f"While loading {image!r}:"):
-                    surf = image.load()
+
+                # Use the decode pool (ThreadPoolExecutor) to load the image
+                # in a worker thread. While the main thread waits for this
+                # image, the preload thread continues decoding other images
+                # in the same pool, giving us parallel loading even during
+                # the synchronous render pass.
+                pool = self.get_decode_pool()
+                if pool is not None:
+                    with renpy.game.ExceptionInfo(f"While loading {image!r}:"):
+                        future = pool.submit(image.load)
+                        surf = future.result()
+                else:
+                    with renpy.game.ExceptionInfo(f"While loading {image!r}:"):
+                        surf = image.load()
             else:
                 surf = image.load()
 
@@ -359,11 +371,22 @@ class Cache:
                     texsurf = ce.surf.subsurface(ce.bounds)
                     renpy.display.render.mutated_surface(texsurf)
 
+                # Build texture properties, combining mipmap and premultiplied hints.
+                properties = {}
+
                 if image.mipmap is not None:
-                    ce.texture = renpy.display.draw.load_texture(
-                        texsurf,
-                        properties={"mipmap": image.mipmap},  # type: ignore
-                    )
+                    properties["mipmap"] = image.mipmap
+
+                # For opaque images (no alpha channel, e.g. JPEG), skip the FTL
+                # premultiply pass. The source pixels already have alpha=255
+                # everywhere, so premultiplication is a no-op. This saves a
+                # full-resolution draw + glCopyTexImage2D + intermediate texture
+                # per image load — significant for 4K CGs.
+                if getattr(image, '_is_opaque', False):
+                    properties["premultiplied"] = True
+
+                if properties:
+                    ce.texture = renpy.display.draw.load_texture(texsurf, properties=properties)
                 else:
                     ce.texture = renpy.display.draw.load_texture(texsurf)
 
@@ -877,7 +900,8 @@ class Image(ImageBase):
                 force_size = e.size
 
             with filelike as f:
-                surf = renpy.display.pgrender.load_image(f, filename)
+                surf, is_opaque = renpy.display.pgrender.load_image(f, filename)
+                self._is_opaque = is_opaque
 
             if force_size is not None:
                 # avoid size-related exceptions (e.g. Crop on a smaller placeholder)
@@ -897,7 +921,8 @@ class Image(ImageBase):
                     filelike = renpy.loader.load(self.filename, directory="images")
 
                     with filelike as f:
-                        surf = renpy.display.pgrender.load_image(filelike, filename, size=(width, height))
+                        surf, is_opaque = renpy.display.pgrender.load_image(filelike, filename, size=(width, height))
+                        self._is_opaque = is_opaque
 
             return surf
 
@@ -957,7 +982,9 @@ class Data(ImageBase):
 
     def load(self):
         f = io.BytesIO(self.data)
-        return renpy.display.pgrender.load_image(f, self.filename)
+        surf, is_opaque = renpy.display.pgrender.load_image(f, self.filename)
+        self._is_opaque = is_opaque
+        return surf
 
 
 class ZipFileImage(ImageBase):
@@ -975,7 +1002,8 @@ class ZipFileImage(ImageBase):
             with zipfile.ZipFile(self.zipfilename, "r") as zf:
                 data = zf.read(self.filename)
                 sio = io.BytesIO(data)
-                rv = renpy.display.pgrender.load_image(sio, self.filename)
+                rv, is_opaque = renpy.display.pgrender.load_image(sio, self.filename)
+                self._is_opaque = is_opaque
             return rv
         except Exception:
             return renpy.display.pgrender.surface((2, 2), True)
@@ -1303,8 +1331,26 @@ class Composite(ImageBase):
 
         rv = renpy.display.pgrender.surface(size, True)
 
-        for pos, im in zip(self.positions, self.images):
-            rv.blit(cache.get(im), [p * os for p in pos])
+        if len(self.images) > 1:
+            # Parallel loading of sub-images. Each cache.get() may trigger
+            # disk I/O and decoding (which releases the GIL). We use a
+            # temporary thread pool to avoid deadlock when called from
+            # within the preload decode pool.
+            with ThreadPoolExecutor(max_workers=min(len(self.images), 4)) as executor:
+                futures = {
+                    executor.submit(cache.get, im): i
+                    for i, (pos, im) in enumerate(zip(self.positions, self.images))
+                }
+                results = [None] * len(self.images)
+                for f in as_completed(futures):
+                    i = futures[f]
+                    results[i] = (self.positions[i], f.result())
+
+            for pos, surf in results:
+                rv.blit(surf, [p * os for p in pos])
+        else:
+            for pos, im in zip(self.positions, self.images):
+                rv.blit(cache.get(im), [p * os for p in pos])
 
         return rv
 

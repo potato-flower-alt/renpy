@@ -1075,7 +1075,7 @@ class Interface:
         window_title = renpy.config.window_title
 
         if window_title is None:
-            window_title = "A Ren'Py Game"
+            window_title = "A Ren'Py Game ★ Custom Build"
 
         caption = renpy.translation.translate_string(window_title) + renpy.store._window_subtitle
 

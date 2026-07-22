@@ -830,6 +830,28 @@ class Channel(object):
 
         return renpysound.get_duration(self.number)
 
+    def seek(self, position):
+        """
+        Seeks the currently playing audio to `position` seconds without
+        tearing down and rebuilding the decode pipeline.
+
+        This is much faster than re-calling `play()` with a `<from X>` clause,
+        because it reuses the already-open FFmpeg stream and already-decrypted
+        audio data. The seek is performed inside the decode thread via
+        ``av_seek_frame``.
+
+        `position`
+            The position in seconds to seek to. Values are clamped to
+            [0, duration].
+        """
+        if not pcm_ok:
+            return
+
+        if self._number is None:
+            return
+
+        renpysound.seek(self.number, position)
+
     def set_pan(self, pan, delay):
         with lock:
             now = get_serial()
@@ -866,6 +888,17 @@ class Channel(object):
             return None
 
         return renpysound.read_video(self.number)
+
+    def playing_at_end(self):
+        """
+        Returns true if the audio playing on this channel has reached its
+        natural end (the playing_at_end flag in the C layer). This means
+        the stream has finished playback with nothing queued.
+        """
+        if not pcm_ok:
+            return False
+
+        return bool(renpysound.playing_at_end(self.number))
 
     def video_ready(self):
         if not pcm_ok:
@@ -1096,13 +1129,20 @@ def init():
             )
             pcm_ok = True
         except Exception:
-            renpy.display.log.write("Audio and video init failed. Proceeding anyway.")
+            renpy.display.log.write("Audio output init failed. Retrying with the dummy audio driver.")
             renpy.display.log.exception()
 
             os.environ["SDL_AUDIODRIVER"] = "dummy"
 
             try:
-                renpysound.init(renpy.config.sound_sample_rate, 2, bufsize, False, renpy.config.equal_mono)
+                renpysound.init(
+                    renpy.config.sound_sample_rate,
+                    2,
+                    bufsize,
+                    False,
+                    renpy.config.equal_mono,
+                    renpy.config.linear_fades,
+                )
                 pcm_ok = True
             except Exception:
                 pcm_ok = False

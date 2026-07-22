@@ -209,7 +209,7 @@ class ScriptTranslator(object):
 
     def lookup_translate(self, identifier, alternate=None) -> tuple[renpy.ast.Node, bool]:
         identifier = identifier.replace(".", "_")
-        language = renpy.game.preferences.language
+        language = get_text_language()
 
         if language is not None:
             tl = self.language_translates.get((identifier, language), None)
@@ -602,7 +602,7 @@ def translate_string(s, language=Default):  # type (str, str|renpy.object.Sentin
     :name: renpy.translate_string
 
     Returns `s` immediately translated into `language`. If `language`
-    is Default, uses the language set in the preferences.
+    is Default, uses the text language set in the preferences.
     Strings enclosed in this function will **not** be added
     to the list of translatable strings. Note that the string may be
     double-translated, if it matches a string translation when it
@@ -610,15 +610,16 @@ def translate_string(s, language=Default):  # type (str, str|renpy.object.Sentin
     """
 
     if language is Default:
-        language = renpy.game.preferences.language
+        language = get_text_language()
 
     stl = renpy.game.script.translator.strings[language]
     return stl.translate(s)
 
 
 def write_updated_strings():
-    stl = renpy.game.script.translator.strings[renpy.game.preferences.language]
-    stl.write_updated_strings(renpy.game.preferences.language)
+    language = get_text_language()
+    stl = renpy.game.script.translator.strings[language]
+    stl.write_updated_strings(language)
 
 
 ################################################################################
@@ -680,6 +681,66 @@ def load_all_rpts():
     for fn in renpy.exports.list_files():
         if fn.endswith(".rpt"):
             load_rpt(fn)
+
+
+################################################################################
+# Per-category language helpers
+################################################################################
+
+
+def get_text_language():
+    """
+    Returns the language to use for text translation (dialogue, strings, etc.).
+    Falls back to the main language if text_language is not set.
+    """
+    return renpy.game.preferences.text_language or renpy.game.preferences.language
+
+
+def get_image_language():
+    """
+    Returns the language to use for image resources.
+    Falls back to the main language if image_language is not set.
+    """
+    return renpy.game.preferences.image_language or renpy.game.preferences.language
+
+
+def get_voice_language():
+    """
+    Returns the language to use for voice/audio resources.
+    Falls back to the main language if voice_language is not set.
+    """
+    return renpy.game.preferences.voice_language or renpy.game.preferences.language
+
+
+# File extension sets for resource type detection.
+IMAGE_EXTS = frozenset({'.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg', '.avif'})
+AUDIO_EXTS = frozenset({'.ogg', '.mp3', '.wav', '.flac', '.opus', '.aac', '.m4a', '.wma'})
+
+
+def get_language_for_file(name=None, directory=None):
+    """
+    Determines the appropriate language based on the file extension of `name`,
+    falling back to the `directory` hint if the extension is not recognized.
+
+    Returns the language string or None.
+    """
+
+    if name:
+        dot = name.rfind('.')
+        if dot >= 0:
+            ext = name[dot:].lower()
+            if ext in IMAGE_EXTS:
+                return get_image_language()
+            elif ext in AUDIO_EXTS:
+                return get_voice_language()
+
+    # Fall back to directory hint.
+    if directory == "images":
+        return get_image_language()
+    elif directory == "audio":
+        return get_voice_language()
+
+    return get_text_language()
 
 
 ################################################################################
@@ -861,6 +922,91 @@ def change_language(language, force: bool = False, rebuild: bool = False):
     old_language = language
 
 
+def change_text_language(language):
+    """
+    Changes the text language to `language`. This affects dialogue translation,
+    string translation, and translate python/style blocks.
+
+    If `language` is None, text falls back to the main language.
+    """
+
+    old = renpy.game.preferences.text_language
+    renpy.game.preferences.text_language = language
+
+    # Determine the effective language for loading translation scripts.
+    effective = get_text_language()
+
+    if effective is not None:
+        renpy.exports.load_language(effective)
+
+    if language == old:
+        renpy.exports.restart_interaction()
+        return
+
+    tl = renpy.game.script.translator
+
+    # Rebuild styles and run translation blocks for the new text language.
+    renpy.style.restore(style_backup)
+    renpy.style.rebuild(False)
+
+    effective = get_text_language()
+
+    gui_defaults = renpy.store.gui._defaults
+    defaulted_variables = {name: getattr(renpy.store.gui, name) for name in gui_defaults}
+
+    for i in renpy.config.translate_clean_stores:
+        renpy.python.clean_store(i)
+
+    for name, value in defaulted_variables.items():
+        setattr(renpy.store.gui, name, value)
+
+    renpy.store.gui._apply_rebuild()
+
+    if renpy.config.new_translate_order:
+        new_change_language(tl, effective, True)
+    else:
+        old_change_language(tl, effective, True)
+
+    for i in renpy.config.translate_clean_stores:
+        renpy.python.reset_store_changes(i)
+
+    renpy.style.rebuild()
+    renpy.display.tts.init()
+
+    renpy.exports.block_rollback()
+    renpy.exports.restart_interaction()
+
+
+def change_image_language(language):
+    """
+    Changes the image language to `language`. This affects which translated
+    image files are loaded from the tl/ directory.
+
+    If `language` is None, images fall back to the main language.
+    """
+
+    old = renpy.game.preferences.image_language
+    renpy.game.preferences.image_language = language
+
+    if language != old:
+        # Clear the image cache so images are reloaded from the new language path.
+        renpy.exports.free_memory()
+
+    renpy.exports.restart_interaction()
+
+
+def change_voice_language(language):
+    """
+    Changes the voice language to `language`. This affects which voice/audio
+    files are loaded from the tl/ directory.
+
+    If `language` is None, voice falls back to the main language.
+    """
+
+    renpy.game.preferences.voice_language = language
+    renpy.exports.restart_interaction()
+
+
 def check_language():
     """
     Checks to see if the language has changed. If it has, jump to the start
@@ -868,13 +1014,14 @@ def check_language():
     """
 
     ctx = renpy.game.contexts[-1]
-    preferences = renpy.game.preferences
 
-    # Deal with a changed language.
-    if ctx.translate_language != preferences.language:
+    # Deal with a changed text language.
+    text_lang = get_text_language()
+
+    if ctx.translate_language != text_lang:
         clean_data()
 
-        ctx.translate_language = preferences.language
+        ctx.translate_language = text_lang
 
         tid = ctx.translate_identifier or ctx.deferred_translate_identifier
 

@@ -529,7 +529,18 @@ init -1500 python hide:
 
     def voice_afm_callback():
 
-        if renpy.sound.is_playing(channel="voice"):
+        # Only update last_playing if the voice is actually still playing,
+        # not just when the stream is kept alive at its natural end.
+        # is_playing() returns True even after the audio finishes because
+        # the C-level playing_name is not cleared until stop() is called.
+        # playing_at_end() detects when the stream has truly finished.
+        try:
+            c = renpy.audio.audio.get_channel("voice")
+            still_playing = renpy.sound.is_playing(channel="voice") and not c.playing_at_end()
+        except Exception:
+            still_playing = renpy.sound.is_playing(channel="voice")
+
+        if still_playing:
             _voice.last_playing = renpy.time.time()
 
         if _preferences.wait_voice:

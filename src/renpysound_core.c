@@ -69,6 +69,7 @@ MediaState *media_open(SDL_RWops *, const char *);
 void media_want_video(MediaState *, int);
 void media_start_end(MediaState *, double, double);
 void media_start(MediaState *);
+void media_seek(MediaState *, double);
 void media_pause(MediaState *, int);
 void media_close(MediaState *);
 
@@ -274,6 +275,11 @@ struct Channel {
     /* The number of samples in which we'll stop. */
     int stop_samples;
 
+    /* True when the stream has reached its natural end (read_length == 0)
+     * and there is no queued track.  The stream is kept alive so the user
+     * can seek backwards and resume playback. */
+    int playing_at_end;
+
     /* The event posted to the queue when we finish the playing stream. */
     int event;
 
@@ -332,6 +338,7 @@ static void start_stream(struct Channel* c, int reset_fade) {
     if (!c) return;
 
     c->pos = 0;
+    c->playing_at_end = 0;
     if (!c->queued) {
         c->playing_pad = audio_spec.freq * 2;
     }
@@ -474,7 +481,7 @@ static void callback(void *userdata, Uint8 *stream, int length) {
                     c->playing_pad -= read_length;
                     memset(stream_buffer, 0, read_length * 2 * sizeof(short));
 
-                } else {
+                } else if (c->queued) {
 
                     int old_tight = c->playing_tight;
                     struct Dying *d;
@@ -526,6 +533,14 @@ static void callback(void *userdata, Uint8 *stream, int length) {
                     start_stream(c, !old_tight);
 
                     continue;
+
+                } else {
+                    /* Natural end of stream with nothing queued.
+                     * Keep the MediaState alive so the user can seek
+                     * backwards and resume playback from the seeked
+                     * position. */
+                    c->playing_at_end = 1;
+                    break;
                 }
             }
 
@@ -799,6 +814,47 @@ void RPS_queue(int channel, SDL_RWops *rw, const char *ext, const char *name, in
     UNLOCK_AUDIO();
 
     error(SUCCESS);
+}
+
+
+/*
+ * Seeks the currently playing stream on `channel` to `position` seconds.
+ *
+ * Unlike RPS_play(), this does NOT tear down and rebuild the decode pipeline.
+ * It simply requests a seek inside the existing decode thread, which calls
+ * av_seek_frame() on the already-open AVFormatContext.  This is dramatically
+ * faster — especially for encrypted audio files, where reopening would
+ * re-trigger AES decryption and anti-tamper checks.
+ *
+ * Safe to call from any thread.  The seek is asynchronous; the audio callback
+ * will pick up the new position within a few frames.
+ */
+void RPS_seek(int channel, double position) {
+
+    struct Channel *c;
+
+    if (check_channel(channel)) {
+        return;
+    }
+
+    c = &channels[channel];
+
+    LOCK_AUDIO();
+
+    if (c->playing) {
+        /* Clear the at-end flag so the stream resumes after seek. */
+        c->playing_at_end = 0;
+
+        /* Reset the position counter to match the seek target.
+         * Without this, RPS_get_pos() would keep reporting the
+         * pre-seek position because c->pos was never updated. */
+        c->pos = (int)(position * audio_spec.freq);
+        c->playing_start_ms = 0;
+
+        media_seek(c->playing, position);
+    }
+
+    UNLOCK_AUDIO();
 }
 
 
@@ -1306,6 +1362,18 @@ int RPS_video_ready(int channel) {
     return rv;
 }
 
+int RPS_playing_at_end(int channel) {
+    struct Channel *c;
+
+    if (check_channel(channel)) {
+        return 0;
+    }
+
+    c = &channels[channel];
+
+    return c->playing_at_end;
+}
+
 /**
  * Marks channel as a video channel.
  */
@@ -1333,6 +1401,10 @@ void RPS_init(int freq, int stereo, int samples, int status, int equal_mono, int
     }
 
     name_mutex = SDL_CreateMutex();
+    if (name_mutex == NULL) {
+        error(SDL_ERROR);
+        return;
+    }
 
 #ifndef __EMSCRIPTEN__
 #if PY_VERSION_HEX < 0x03070000
@@ -1343,6 +1415,8 @@ void RPS_init(int freq, int stereo, int samples, int status, int equal_mono, int
 
 
     if (SDL_Init(SDL_INIT_AUDIO)) {
+        SDL_DestroyMutex(name_mutex);
+        name_mutex = NULL;
         error(SDL_ERROR);
         return;
     }
@@ -1355,6 +1429,19 @@ void RPS_init(int freq, int stereo, int samples, int status, int equal_mono, int
     audio_spec.userdata = NULL;
 
     if (SDL_OpenAudio(&audio_spec, NULL)) {
+        char sdl_error[1024];
+        SDL_strlcpy(sdl_error, SDL_GetError(), sizeof(sdl_error));
+
+        /*
+         * SDL selects its audio driver when the audio subsystem starts. If
+         * opening the device fails, leave the subsystem uninitialized so the
+         * caller can select another driver and retry.
+         */
+        SDL_QuitSubSystem(SDL_INIT_AUDIO);
+        SDL_DestroyMutex(name_mutex);
+        name_mutex = NULL;
+
+        SDL_SetError("%s", sdl_error);
         error(SDL_ERROR);
         return;
     }
@@ -1387,6 +1474,10 @@ void RPS_quit() {
     }
 
     SDL_CloseAudio();
+    SDL_QuitSubSystem(SDL_INIT_AUDIO);
+
+    SDL_DestroyMutex(name_mutex);
+    name_mutex = NULL;
 
     num_channels = 0;
     initialized = 0;

@@ -1,4 +1,4 @@
-﻿# Copyright 2004-2026 Tom Rothamel <pytom@bishoujo.us>
+# Copyright 2004-2026 Tom Rothamel <pytom@bishoujo.us>
 #
 # Permission is hereby granted, free of charge, to any person
 # obtaining a copy of this software and associated documentation files
@@ -94,7 +94,9 @@ init -1500 python:
                         config.default_language = lang_name
 
             if config.default_language is not None:
-                _preferences.language = config.default_language
+                _preferences.text_language = config.default_language
+                _preferences.image_language = config.default_language
+                _preferences.voice_language = config.default_language
 
             if config.default_wait_for_voice is not None:
                 _preferences.wait_voice = config.default_wait_for_voice

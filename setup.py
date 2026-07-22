@@ -61,6 +61,7 @@ def main():
     cython("renpy.pydict")
     cython("renpy.style")
     cython("renpy.encryption")
+    cython("renpy.aescrypt", [ "src/aes_rpa.c" ], packages="openssl")
     cython("renpy.tfd", [ "src/tinyfiledialogs/tinyfiledialogs.c" ])
     cython("renpy.ecsign", [ "src/ec_sign_core.c" ], packages="openssl")
 

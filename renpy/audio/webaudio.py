@@ -236,6 +236,19 @@ def stop(channel):
 
 
 @proxy_with_channel
+def seek(channel, position):
+    """
+    Seeks the currently playing audio on `channel` to `position` seconds.
+
+    Note: On web (Emscripten) builds, runtime seek inside an existing
+    decode pipeline is not supported.  This function is a no-op in that
+    environment.
+    """
+
+    call("seek", channel, position)
+
+
+@proxy_with_channel
 def dequeue(channel, even_tight=False):
     """
     Dequeues the queued sound file.
@@ -559,6 +572,14 @@ def read_video(channel):
 
     # Other errors happened
     return None
+
+
+def playing_at_end(channel):
+    """
+    Returns true if the audio playing on `channel` has reached its natural
+    end (playing_at_end flag).
+    """
+    return False
 
 
 # No video will be played from this channel.

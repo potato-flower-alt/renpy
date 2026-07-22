@@ -59,6 +59,7 @@ cdef extern from "renpysound_core.h":
 
     void RPS_play(int channel, SDL_RWops *rw, char *ext, char* name, int synchro_start, int fadein, int tight, double start, double end, float volume, object audio_filter)
     void RPS_queue(int channel, SDL_RWops *rw, char *ext, char *name, int synchro_start, int fadein, int tight, double start, double end, float volume, object audio_filter)
+    void RPS_seek(int channel, double position)
     void RPS_stop(int channel)
     void RPS_dequeue(int channel, int even_tight)
     int RPS_queue_depth(int channel)
@@ -79,6 +80,7 @@ cdef extern from "renpysound_core.h":
     void RPS_advance_time()
     int RPS_video_ready(int channel)
     object RPS_read_video(int channel)
+    int RPS_playing_at_end(int channel)
     void RPS_set_video(int channel, int video)
 
     void RPS_sample_surfaces(object, object)
@@ -197,6 +199,26 @@ def stop(channel):
     """
 
     RPS_stop(channel)
+    check_error()
+
+
+def seek(channel, position):
+    """
+    Seeks the currently playing audio on `channel` to `position` seconds.
+
+    This performs a lightweight seek inside the existing decode pipeline
+    without tearing down and rebuilding the FFmpeg stream.  It is
+    dramatically faster than calling play() with a ``<from X>`` clause —
+    especially for encrypted audio files.
+
+    `channel`
+        The channel number to seek on.
+
+    `position`
+        The position in seconds to seek to.
+    """
+
+    RPS_seek(channel, position)
     check_error()
 
 
@@ -402,6 +424,16 @@ def read_video(channel):
     # This has to be set to the same number it is in ffmedia.c
     FRAME_PADDING = 4
     return rv.subsurface((FRAME_PADDING, FRAME_PADDING, w - FRAME_PADDING * 2, h - FRAME_PADDING * 2))
+
+
+def playing_at_end(channel):
+    """
+    Returns true if the audio playing on `channel` has reached its natural
+    end (playing_at_end flag). This means the stream has finished playback
+    with nothing queued, but the stream is kept alive for seeking.
+    """
+
+    return bool(RPS_playing_at_end(channel))
 
 
 # No video will be played from this channel.

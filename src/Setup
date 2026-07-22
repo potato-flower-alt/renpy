@@ -7,6 +7,7 @@ renpy.lexersupport ../tmp/gen/renpy.lexersupport.c
 renpy.pydict ../tmp/gen/renpy.pydict.c
 renpy.style ../tmp/gen/renpy.style.c
 renpy.encryption ../tmp/gen/renpy.encryption.c
+renpy.aescrypt ../tmp/gen/renpy.aescrypt.c aes_rpa.c
 renpy.ecsign  ../tmp/gen/renpy.ecsign.c ec_sign_core.c ec_sign_core_web.c
 renpy.styledata.styleclass ../tmp/gen/renpy.styledata.styleclass.c
 renpy.styledata.stylesets ../tmp/gen/renpy.styledata.stylesets.c

@@ -1,5 +1,6 @@
 # Copyright 2014 Patrick Dawson <pat@dw.is>
 # Copyright 2014 Tom Rothamel <tom@rothamel.us>
+# Modified in 2026 by the Ren'Py fork contributors: borderless fullscreen support.
 #
 # This software is provided 'as-is', without any express or implied
 # warranty.  In no event will the authors be held liable for any damages
@@ -37,6 +38,17 @@ ios = ("PYGAME_IOS" in os.environ)
 
 # A map from a renpy.pygame hint to what it was set to.
 _pygame_hints = { }
+
+def _borderless_fullscreen_enabled():
+    return (os.name == "nt") and (_get_hint("renpy.pygame_BORDERLESS_FULLSCREEN", "1") != "0")
+
+def _borderless_fullscreen_padding():
+    return int(_get_hint("renpy.pygame_BORDERLESS_FULLSCREEN_PADDING", "1"))
+
+def _borderless_fullscreen_rect(x, y, w, h):
+    pad = _borderless_fullscreen_padding()
+
+    return (x - pad, y - pad, w + pad * 2, h + pad * 2)
 
 def hint(hint, value, priority=1):
 
@@ -131,11 +143,37 @@ except ImportError:
 cdef class Window:
     def __init__(self, title, resolution=(0, 0), flags=0, depth=0, pos=(SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED), Surface shape=None):
         cdef SDL_WindowShapeMode shape_mode
+        cdef SDL_Rect display_bounds
+        cdef bint borderless_fullscreen
 
         if not isinstance(title, bytes):
             title = title.encode("utf-8")
 
         self.create_flags = flags
+        self.borderless_fullscreen = False
+        self.saved_window_bounds = False
+        self.windowed_x = 0
+        self.windowed_y = 0
+        self.windowed_w = 0
+        self.windowed_h = 0
+
+        borderless_fullscreen = bool(flags & SDL_WINDOW_FULLSCREEN_DESKTOP) and _borderless_fullscreen_enabled()
+
+        if borderless_fullscreen:
+            if SDL_GetDisplayBounds(0, &display_bounds):
+                raise error()
+
+            flags &= ~(SDL_WINDOW_FULLSCREEN | SDL_WINDOW_FULLSCREEN_DESKTOP | SDL_WINDOW_RESIZABLE)
+            flags |= SDL_WINDOW_BORDERLESS
+            x, y, w, h = _borderless_fullscreen_rect(
+                display_bounds.x,
+                display_bounds.y,
+                display_bounds.w,
+                display_bounds.h,
+            )
+            pos = (x, y)
+            resolution = (w, h)
+            self.borderless_fullscreen = True
 
         # If we do not get the AVOID_GL hint, we always create a GL-compatible
         # window. This lets us change the OPENGL flag later on.
@@ -283,10 +321,12 @@ cdef class Window:
         opengl context if present.
         """
 
+        cdef SDL_Rect display_bounds
+        cdef int display_index = 0
         flags = SDL_GetWindowFlags(self.window)
 
         if fullscreen is None:
-            fullscreen = flags & SDL_WINDOW_FULLSCREEN_DESKTOP
+            fullscreen = (flags & SDL_WINDOW_FULLSCREEN_DESKTOP) or self.borderless_fullscreen
 
         if maximized is None:
             maximized = flags & SDL_WINDOW_MAXIMIZED
@@ -307,12 +347,53 @@ cdef class Window:
         if (not fullscreen) and (not maximized) and (flags & SDL_WINDOW_MAXIMIZED):
             SDL_RestoreWindow(self.window)
 
-        if fullscreen:
+        if self.borderless_fullscreen and not fullscreen:
+            SDL_SetWindowBordered(self.window, SDL_FALSE if (self.create_flags & SDL_WINDOW_BORDERLESS) else SDL_TRUE)
+            SDL_SetWindowResizable(self.window, SDL_TRUE if (self.create_flags & SDL_WINDOW_RESIZABLE) else SDL_FALSE)
+            self.borderless_fullscreen = False
 
+            if self.saved_window_bounds and not maximized:
+                SDL_SetWindowPosition(self.window, self.windowed_x, self.windowed_y)
+                SDL_SetWindowSize(self.window, self.windowed_w, self.windowed_h)
+
+        if fullscreen and _borderless_fullscreen_enabled():
+            if not self.borderless_fullscreen:
+                if not (flags & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_FULLSCREEN_DESKTOP)):
+                    SDL_GetWindowPosition(self.window, &self.windowed_x, &self.windowed_y)
+                    SDL_GetWindowSize(self.window, &self.windowed_w, &self.windowed_h)
+                    self.saved_window_bounds = True
+
+                SDL_SetWindowFullscreen(self.window, 0)
+
+                if flags & SDL_WINDOW_MAXIMIZED:
+                    SDL_RestoreWindow(self.window)
+
+                display_index = SDL_GetWindowDisplayIndex(self.window)
+
+                if display_index < 0:
+                    display_index = 0
+
+                if SDL_GetDisplayBounds(display_index, &display_bounds):
+                    raise error()
+
+                x, y, w, h = _borderless_fullscreen_rect(
+                    display_bounds.x,
+                    display_bounds.y,
+                    display_bounds.w,
+                    display_bounds.h,
+                )
+
+                SDL_SetWindowBordered(self.window, SDL_FALSE)
+                SDL_SetWindowResizable(self.window, SDL_FALSE)
+                SDL_SetWindowPosition(self.window, x, y)
+                SDL_SetWindowSize(self.window, w, h)
+                self.borderless_fullscreen = True
+
+        elif fullscreen:
             if SDL_SetWindowFullscreen(self.window, SDL_WINDOW_FULLSCREEN_DESKTOP):
                 fullscreen = False
 
-        if not fullscreen:
+        if (not fullscreen) or self.borderless_fullscreen:
             SDL_SetWindowFullscreen(self.window, 0)
 
         if (not fullscreen) and (not maximized):
@@ -356,6 +437,9 @@ cdef class Window:
 
     def get_window_flags(self):
         rv = SDL_GetWindowFlags(self.window)
+
+        if self.borderless_fullscreen:
+            rv |= SDL_WINDOW_FULLSCREEN_DESKTOP
 
         if self.gl_context:
             rv |= SDL_WINDOW_OPENGL
@@ -439,12 +523,10 @@ cdef class Window:
         return True
 
     def toggle_fullscreen(self):
-        if SDL_GetWindowFlags(self.window) & (SDL_WINDOW_FULLSCREEN_DESKTOP):
-            if SDL_SetWindowFullscreen(self.window, 0):
-                raise error()
+        if self.get_window_flags() & (SDL_WINDOW_FULLSCREEN_DESKTOP):
+            self.resize(self.get_size(), fullscreen=False)
         else:
-            if SDL_SetWindowFullscreen(self.window, SDL_WINDOW_FULLSCREEN_DESKTOP):
-                raise error()
+            self.resize(self.get_size(), fullscreen=True)
 
         return True
 

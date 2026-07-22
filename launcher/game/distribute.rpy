@@ -1,4 +1,4 @@
-﻿# Copyright 2004-2026 Tom Rothamel <pytom@bishoujo.us>
+# Copyright 2004-2026 Tom Rothamel <pytom@bishoujo.us>
 #
 # Permission is hereby granted, free of charge, to any person
 # obtaining a copy of this software and associated documentation files
@@ -998,6 +998,31 @@ fix_dlc("renios", "renios")
                     os.makedirs(abs_subdir, exist_ok=True)
 
                 af = archiver.Archive(arcpath)
+
+                key_path = os.path.join(self.project.path, "game", ".archive_key")
+                if os.path.exists(key_path):
+                    try:
+                        with open(key_path, "r") as kf:
+                            encryption_key_hex = kf.read().strip()
+
+                        if not encryption_key_hex:
+                            raise ValueError("Key file is empty")
+
+                        encryption_key = bytes.fromhex(encryption_key_hex)
+                        if len(encryption_key) != 32:
+                            raise ValueError("Key must be 32 bytes (64 hex chars)")
+
+                        af = archiver.EncryptedArchive(arcpath, encryption_key)
+                        self.reporter.info(_("Using encrypted archive (RPAE-2.0)..."))
+                    except (ValueError, TypeError) as e:
+                        self.reporter.info(_("Invalid encryption key: %s. Using unencrypted archive.") % str(e))
+                    finally:
+                        # Remove .archive_key from the staging directory so it is
+                        # never included in the built distribution.
+                        tmp_key_path = os.path.join(self.project.tmp, "game", ".archive_key")
+                        if os.path.exists(tmp_key_path):
+                            os.unlink(tmp_key_path)
+
 
                 fll = len(self.file_lists[arcname])
 

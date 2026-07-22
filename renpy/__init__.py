@@ -196,6 +196,7 @@ backup_blacklist = {
     "renpy.display.swdraw",
     "renpy.display.test",
     "renpy.six",
+    "renpy.aescrypt",
     "renpy.text.ftfont",
     "renpy.text.hbfont",
     "renpy.text.bidi",
@@ -408,6 +409,7 @@ def import_all():
     import renpy.color
     import renpy.easy
     import renpy.encryption
+    import renpy.aescrypt
     import renpy.execution
     import renpy.lexer
     import renpy.loadsave
@@ -713,6 +715,7 @@ if typing.TYPE_CHECKING:
     from . import dump as dump
     from . import easy as easy
     from . import editor as editor
+    from . import aescrypt as aescrypt
     from . import encryption as encryption
     from . import error as error
     from . import execution as execution

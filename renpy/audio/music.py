@@ -266,6 +266,29 @@ def queue(filenames, channel="music", loop=None, clear_queue=True, fadein=0, tig
                 raise
 
 
+def seek(position, channel="music"):
+    """
+    :doc: audio
+
+    Seeks the currently playing audio on `channel` to `position` seconds.
+
+    Unlike re-calling :func:`renpy.music.play` with a ``<from X>`` clause,
+    this performs a lightweight seek inside the existing decode pipeline
+    without re-opening the file or re-decrypting audio data. This makes
+    progress-bar scrubbing significantly smoother, especially for large
+    encrypted audio files.
+
+    `position`
+        The position in seconds to seek to. Values are clamped to the
+        valid range internally.
+
+    `channel`
+        The channel to seek on. Defaults to "music".
+    """
+    c = get_channel(channel)
+    c.seek(position)
+
+
 def playable(filename, channel="music"):
     """
     Return true if the given filename is playable on the channel. This

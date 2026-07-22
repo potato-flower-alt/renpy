@@ -1,4 +1,4 @@
-﻿# Copyright 2004-2026 Tom Rothamel <pytom@bishoujo.us>
+# Copyright 2004-2026 Tom Rothamel <pytom@bishoujo.us>
 #
 # Permission is hereby granted, free of charge, to any person
 # obtaining a copy of this software and associated documentation files
@@ -227,7 +227,7 @@ init python:
             reporter=reporter,
             packages=packages,
             build_update=False,
-            noarchive=True,
+            noarchive=False,
             packagedest=dist,
             report_success=False,
             )

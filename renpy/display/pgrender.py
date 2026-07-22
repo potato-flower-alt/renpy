@@ -172,6 +172,10 @@ def load_image(f, filename, size=None):
     `size`
         If given, the image is scaled to this size. This only works for
         SVG images.
+
+    Returns a (surface, is_opaque) tuple. `is_opaque` is True when the source
+    image has no alpha channel (e.g. JPEG), meaning alpha premultiplication
+    can be skipped during GPU texture upload.
     """
 
     _basename, _dot, ext = filename.rpartition(".")
@@ -196,11 +200,22 @@ def load_image(f, filename, size=None):
 
         raise Exception("Could not load image {!r}{}: {!r}".format(filename, extra, e))
 
+    # Detect if the source image has no alpha channel (e.g. JPEG, opaque PNG).
+    # We check before copy_surface_unscaled because the copy always creates
+    # an RGBA surface, losing the original format information.
+    masks = surf.get_masks()
+    is_opaque = len(masks) < 4 or masks[3] == 0
+
     rv = copy_surface_unscaled(surf)
+    return rv, is_opaque
+
+
+def load_image_unscaled(f, filename, size=None):
+    """
+    Like load_image, but returns only the surface (for backward compatibility).
+    """
+    rv, _ = load_image(f, filename, size=size)
     return rv
-
-
-load_image_unscaled = load_image
 
 
 # Wrapper around functions we use from pygame.surface.

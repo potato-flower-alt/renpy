@@ -117,6 +117,12 @@ steam_appid.txt
 # Android.
 *.keystore
 
+# VMProtect SDK (commercial, do not commit).
+/src/vmprotect/
+
+# Per-project archive encryption keys. These must never be committed.
+**/.archive_key
+
 # Type analysis.
 /typings
 

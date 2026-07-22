@@ -3,6 +3,8 @@
 #include <libswresample/swresample.h>
 #include <libavutil/time.h>
 #include <libavutil/pixfmt.h>
+#include <libavutil/pixdesc.h>
+#include <libavutil/hwcontext.h>
 #include <libswscale/swscale.h>
 
 #include <SDL2/SDL.h>
@@ -26,14 +28,14 @@ static double stereo_matrix[] = { 1.0, 1.0 };
 /* The output audio sample rate. */
 static int audio_sample_rate = 44100;
 
-static int audio_sample_increase = 44100 / 5;
+static int audio_sample_increase = 44100;
 static int audio_target_samples = 44100 * 2;
 
 const int CHANNELS = 2;
 const int BPC = 2; // Bytes per channel.
 const int BPS = 4; // Bytes per sample.
 
-const int FRAMES = 3;
+const int FRAMES = 10;
 
 // The alignment of each row of pixels.
 const int ROW_ALIGNMENT = 16;
@@ -71,11 +73,7 @@ static int rwops_read(void *opaque, uint8_t *buf, int buf_size) {
 
 }
 
-#if (LIBAVFORMAT_VERSION_MAJOR < 61)
-static int rwops_write(void *opaque, uint8_t *buf, int buf_size) {
-#else
 static int rwops_write(void *opaque, const uint8_t *buf, int buf_size) {
-#endif
     printf("Writing to an SDL_rwops is a really bad idea.\n");
     return -1;
 }
@@ -203,6 +201,12 @@ typedef struct MediaState {
 	int audio_finished;
 	int video_finished;
 
+	/* Runtime seek request. Set by media_seek() from another thread,
+	 * processed by the decode_thread loop.  When seek_req is non-zero,
+	 * the decoder flushes its queues and jumps to seek_target (seconds). */
+	int seek_req;
+	double seek_target;
+
 	/* Indexes of video and audio streams. */
 	int video_stream;
 	int audio_stream;
@@ -249,6 +253,12 @@ typedef struct MediaState {
 
 	/* A frame that video is decoded into. */
 	AVFrame *video_decode_frame;
+
+	/* Hardware device context for GPU-accelerated decoding. */
+	AVBufferRef *hw_device_ctx;
+
+	/* Temporary frame for GPU→CPU transfer of hardware-decoded frames. */
+	AVFrame *hw_frame;
 
 	/* Video Stuff ***********************************************************/
 
@@ -307,6 +317,13 @@ static void deallocate(MediaState *ms) {
 		av_free(sqe);
 	}
 
+	if (ms->hw_frame) {
+		av_frame_free(&ms->hw_frame);
+	}
+	if (ms->hw_device_ctx) {
+		av_buffer_unref(&ms->hw_device_ctx);
+	}
+
 	if (ms->sws) {
 		sws_freeContext(ms->sws);
 	}
@@ -359,7 +376,6 @@ static void deallocate(MediaState *ms) {
 		}
 
 		avformat_close_input(&ms->ctx);
-		avformat_free_context(ms->ctx);
 	}
 
 	/* Destroy alloc stuff. */
@@ -580,8 +596,60 @@ static void check_surface_queue(MediaState *ms) {
 
 /* Find decoder context ******************************************************/
 
+/* Custom get_format callback that rejects all HW pixel formats.
+ * Used in software fallback path to prevent internal hwaccel from activating. */
+static enum AVPixelFormat sw_get_format(struct AVCodecContext *s, const enum AVPixelFormat *pix_fmts) {
+	for (const enum AVPixelFormat *p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
+		const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(*p);
+		if (desc && !(desc->flags & AV_PIX_FMT_FLAG_HWACCEL))
+			return *p;
+	}
+	return AV_PIX_FMT_NONE;
+}
 
-static AVCodecContext *find_context(AVFormatContext *ctx, int index) {
+/* Custom get_format for hardware decode. Prefers AV_PIX_FMT_D3D11
+ * (the modern D3D11VA2 path) over AV_PIX_FMT_D3D11VA_VLD (the legacy
+ * AD_HOC path that does not properly create a decoder). */
+static enum AVPixelFormat hw_get_format(struct AVCodecContext *s, const enum AVPixelFormat *pix_fmts) {
+	/* Prefer AV_PIX_FMT_D3D11 (modern D3D11VA2, pix_fmt 171). */
+	for (const enum AVPixelFormat *p = pix_fmts; *p != AV_PIX_FMT_NONE; p++) {
+		if (*p == AV_PIX_FMT_D3D11)
+			return *p;
+	}
+	return pix_fmts[0];
+}
+
+static enum AVHWDeviceType get_preferred_hw_device_type(void) {
+#ifdef _WIN32
+    return AV_HWDEVICE_TYPE_D3D11VA;
+#elif defined(__ANDROID__)
+    return AV_HWDEVICE_TYPE_MEDIACODEC;
+#else
+    return AV_HWDEVICE_TYPE_NONE;
+#endif
+}
+
+#ifdef __ANDROID__
+#include <jni.h>
+#include <SDL2/SDL_system.h>
+#include <libavcodec/jni.h>
+
+static int init_android_jni(void) {
+    JNIEnv *env = (JNIEnv *)SDL_AndroidGetJNIEnv();
+    if (!env) return -1;
+
+    JavaVM *jvm = NULL;
+    (*env)->GetJavaVM(env, &jvm);
+    if (!jvm) return -1;
+
+    return av_jni_set_java_vm(jvm, NULL);
+}
+#endif
+
+static AVCodecContext *find_context(
+    AVFormatContext *ctx, int index,
+    AVBufferRef **hw_device_ctx_out
+) {
 
     AVDictionary *opts = NULL;
 
@@ -589,10 +657,7 @@ static AVCodecContext *find_context(AVFormatContext *ctx, int index) {
 		return NULL;
 	}
 
-	const AVCodec *codec = NULL;
-	AVCodecContext *codec_ctx = NULL;
-
-	codec_ctx = avcodec_alloc_context3(NULL);
+	AVCodecContext *codec_ctx = avcodec_alloc_context3(NULL);
 
 	if (codec_ctx == NULL) {
 		return NULL;
@@ -604,21 +669,69 @@ static AVCodecContext *find_context(AVFormatContext *ctx, int index) {
 
 	codec_ctx->pkt_timebase = ctx->streams[index]->time_base;
 
-    codec = avcodec_find_decoder(codec_ctx->codec_id);
+	const AVCodec *codec = avcodec_find_decoder(codec_ctx->codec_id);
 
-    if (codec == NULL) {
-        goto fail;
-    }
-
-    codec_ctx->codec_id = codec->id;
-
-    av_dict_set(&opts, "threads", "auto", 0);
-    av_dict_set(&opts, "refcounted_frames", "0", 0);
-
-	if (avcodec_open2(codec_ctx, codec, &opts)) {
+	if (codec == NULL) {
 		goto fail;
 	}
 
+	codec_ctx->codec_id = codec->id;
+
+	av_dict_set(&opts, "threads", "auto", 0);
+
+	// Attempt hardware decoding.
+	// We skip avcodec_get_hw_config() pre-check because some codecs
+	// (e.g. AV1) register D3D11VA hwaccel via the internal AVHWAccel
+	// mechanism, not through hw_configs. Just try av_hwdevice_ctx_create
+	// and let avcodec_open2 be the gate.
+	//
+	// AV1 hardware decode via D3D11VA is skipped because the GPU→CPU
+	// av_hwframe_transfer_data per frame is a blocking PCIe read that
+	// is slower than software decode (180 MB/s for 1080p 10-bit).
+	if (hw_device_ctx_out && codec_ctx->codec_id != AV_CODEC_ID_AV1) {
+		enum AVHWDeviceType hw_type = get_preferred_hw_device_type();
+		av_log(NULL, AV_LOG_ERROR, "[ffmedia] find_context: hw_type=%d codec=%s\n", hw_type, avcodec_get_name(codec_ctx->codec_id));
+
+		if (hw_type != AV_HWDEVICE_TYPE_NONE) {
+#ifdef __ANDROID__
+			if (hw_type == AV_HWDEVICE_TYPE_MEDIACODEC) {
+				init_android_jni();
+			}
+#endif
+			int ret = av_hwdevice_ctx_create(hw_device_ctx_out, hw_type, NULL, NULL, 0);
+			if (ret >= 0) {
+				codec_ctx->hw_device_ctx = av_buffer_ref(*hw_device_ctx_out);
+
+				// Set get_format to prefer AV_PIX_FMT_D3D11
+				// (D3D11VA2) over AV_PIX_FMT_D3D11VA_VLD (legacy
+				// AD_HOC D3D11VA which doesn't create a decoder).
+				codec_ctx->get_format = hw_get_format;
+
+				if (avcodec_open2(codec_ctx, codec, &opts) >= 0) {
+					av_log(NULL, AV_LOG_ERROR, "[ffmedia] using hardware decode for codec=%s\n", avcodec_get_name(codec_ctx->codec_id));
+					av_dict_free(&opts);
+					return codec_ctx;
+				}
+
+				// HW open failed, clean up and fall back to software.
+				av_log(NULL, AV_LOG_ERROR, "[ffmedia] HW open failed, falling back to SW for codec=%s\n", avcodec_get_name(codec_ctx->codec_id));
+				av_buffer_unref(&codec_ctx->hw_device_ctx);
+				av_buffer_unref(hw_device_ctx_out);
+				*hw_device_ctx_out = NULL;
+			}
+		}
+	}
+
+	// Software decode fallback.
+	// Must call avcodec_open2 BEFORE setting get_format because some
+	// codecs (e.g. AV1) override get_format in their init function.
+	av_log(NULL, AV_LOG_ERROR, "[ffmedia] using software decode for codec=%s\n", avcodec_get_name(codec_ctx->codec_id));
+	if (avcodec_open2(codec_ctx, codec, &opts) < 0) {
+		goto fail;
+	}
+	codec_ctx->get_format = sw_get_format;
+
+	av_dict_free(&opts);
 	return codec_ctx;
 
 fail:
@@ -694,33 +807,9 @@ static void decode_audio(MediaState *ms) {
 			}
 
             converted_frame->sample_rate = audio_sample_rate;
-#if (LIBAVUTIL_VERSION_MAJOR < 59)
-            converted_frame->channel_layout = AV_CH_LAYOUT_STEREO;
-#else
             converted_frame->ch_layout = (AVChannelLayout) AV_CHANNEL_LAYOUT_STEREO;
-#endif
             converted_frame->format = AV_SAMPLE_FMT_S16;
 
-#if (LIBAVUTIL_VERSION_MAJOR < 59)
-			if (!ms->audio_decode_frame->channel_layout) {
-				ms->audio_decode_frame->channel_layout = av_get_default_channel_layout(ms->audio_decode_frame->channels);
-
-				if (audio_equal_mono && (ms->audio_decode_frame->channels == 1)) {
-				    swr_alloc_set_opts(
-                        ms->swr,
-                        converted_frame->channel_layout,
-                        converted_frame->format,
-                        converted_frame->sample_rate,
-                        ms->audio_decode_frame->channel_layout,
-                        ms->audio_decode_frame->format,
-                        ms->audio_decode_frame->sample_rate,
-                        0,
-                        NULL);
-
-				    swr_set_matrix(ms->swr, stereo_matrix, 1);
-				}
-			}
-#else
 			if (ms->audio_decode_frame->ch_layout.order == AV_CHANNEL_ORDER_UNSPEC) {
 				av_channel_layout_default(&ms->audio_decode_frame->ch_layout, ms->audio_decode_frame->ch_layout.nb_channels);
 
@@ -739,7 +828,6 @@ static void decode_audio(MediaState *ms) {
 				    swr_set_matrix(ms->swr, stereo_matrix, 1);
 				}
 			}
-#endif
 
 			if(swr_convert_frame(ms->swr, converted_frame, ms->audio_decode_frame)) {
 				av_frame_free(&converted_frame);
@@ -817,20 +905,52 @@ static SurfaceQueueEntry *decode_video_frame(MediaState *ms) {
 		} else if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
 			// pass
 		} else {
-			ms->video_finished = 1;
-			return NULL;
+			av_log(NULL, AV_LOG_ERROR, "[ffmedia] send_packet error ret=%d hw_device_ctx=%p\n", ret, (void*)ms->hw_device_ctx);
+			// HW decode may fail on unsupported codec+GPU combos
+			if (ms->hw_device_ctx) {
+				av_log(NULL, AV_LOG_ERROR, "[ffmedia] HW→SW fallback (send_packet) triggered, reopening codec\n");
+				avcodec_free_context(&ms->video_context);
+				av_buffer_unref(&ms->hw_device_ctx);
+				ms->hw_device_ctx = NULL;
+				ms->video_context = find_context(ms->ctx, ms->video_stream, NULL);
+				if (!ms->video_context) {
+					continue;
+				}
+				continue;
+			}
+				continue;
 		}
 
 		ret = avcodec_receive_frame(ms->video_context, ms->video_decode_frame);
 
 		// More input is needed.
+
+			if (ret == AVERROR_EOF) {
+				ms->video_finished = 1;
+				return NULL;
+			}
+
 		if (ret == AVERROR(EAGAIN)) {
 			continue;
 		}
 
 		if (ret < 0) {
-			ms->video_finished = 1;
-			return NULL;
+			av_log(NULL, AV_LOG_ERROR, "[ffmedia] receive_frame error ret=%d hw_device_ctx=%p\n", ret, (void*)ms->hw_device_ctx);
+			// HW decode may fail on unsupported codec+GPU combos
+			if (ms->hw_device_ctx) {
+				av_log(NULL, AV_LOG_ERROR, "[ffmedia] HW→SW fallback triggered, reopening codec\n");
+				avcodec_free_context(&ms->video_context);
+				av_buffer_unref(&ms->hw_device_ctx);
+				ms->hw_device_ctx = NULL;
+				ms->video_context = find_context(ms->ctx, ms->video_stream, NULL);
+				av_log(NULL, AV_LOG_ERROR, "[ffmedia] fallback find_context returned %p\n", (void*)ms->video_context);
+				if (!ms->video_context) {
+					continue;
+				}
+				continue;
+			}
+			// Skip this frame and keep decoding.
+			continue;
 		}
 
 		break;
@@ -848,7 +968,7 @@ static SurfaceQueueEntry *decode_video_frame(MediaState *ms) {
 		// If we're 5s behind, give up on video for the time being, so we don't
 		// blow out memory.
 		if (ms->video_pts_offset + pts < ms->video_read_time - 5.0) {
-			ms->video_finished = 1;
+			// Skip this frame and keep decoding.
 		}
 
 		if (ms->frame_drops) {
@@ -856,16 +976,38 @@ static SurfaceQueueEntry *decode_video_frame(MediaState *ms) {
 		}
 	}
 
+	// If this is a hardware frame, transfer it back to CPU memory.
+	AVFrame *sw_frame = ms->video_decode_frame;
+
+	if (ms->hw_device_ctx) {
+		const AVPixFmtDescriptor *desc = av_pix_fmt_desc_get(
+			ms->video_decode_frame->format);
+
+		if (desc && (desc->flags & AV_PIX_FMT_FLAG_HWACCEL)) {
+			if (!ms->hw_frame) {
+				ms->hw_frame = av_frame_alloc();
+				if (!ms->hw_frame) return NULL;
+			}
+
+			int ret = av_hwframe_transfer_data(ms->hw_frame,
+			                                   ms->video_decode_frame, 0);
+			if (ret < 0) return NULL;
+
+			av_frame_copy_props(ms->hw_frame, ms->video_decode_frame);
+			sw_frame = ms->hw_frame;
+		}
+	}
+
 	SDL_Surface *sample = rgba_surface;
 
 	if (ms->sws == NULL) {
 		ms->sws = sws_getContext(
-			ms->video_decode_frame->width,
-			ms->video_decode_frame->height,
-			ms->video_decode_frame->format,
+			sw_frame->width,
+			sw_frame->height,
+			sw_frame->format,
 
-			ms->video_decode_frame->width,
-			ms->video_decode_frame->height,
+			sw_frame->width,
+			sw_frame->height,
 			get_pixel_format(sample),
 
 			SWS_POINT | SWS_FULL_CHR_H_INP | SWS_FULL_CHR_H_INT,
@@ -877,16 +1019,16 @@ static SurfaceQueueEntry *decode_video_frame(MediaState *ms) {
 
 
 		if (!ms->sws) {
-			ms->video_finished = 1;
-			return NULL;
+					ms->video_finished = 1;
+					return NULL;
 		}
 
-		int colorspace = ms->video_decode_frame->colorspace;
+		int colorspace = sw_frame->colorspace;
 		if (colorspace == AVCOL_SPC_UNSPECIFIED) {
 			colorspace = SWS_CS_DEFAULT;
 		}
 
-		int src_range = (ms->video_decode_frame->color_range == AVCOL_RANGE_JPEG) ? 1 : 0;
+		int src_range = (sw_frame->color_range == AVCOL_RANGE_JPEG) ? 1 : 0;
 
 		sws_setColorspaceDetails(ms->sws,
 			sws_getCoefficients(colorspace), src_range,
@@ -896,11 +1038,11 @@ static SurfaceQueueEntry *decode_video_frame(MediaState *ms) {
 
 	SurfaceQueueEntry *rv = av_malloc(sizeof(SurfaceQueueEntry));
 	if (rv == NULL) {
-		ms->video_finished = 1;
-		return NULL;
+					ms->video_finished = 1;
+					return NULL;
 	}
-	rv->w = ms->video_decode_frame->width + FRAME_PADDING * 2;
-	rv->h = ms->video_decode_frame->height + FRAME_PADDING * 2;
+	rv->w = sw_frame->width + FRAME_PADDING * 2;
+	rv->h = sw_frame->height + FRAME_PADDING * 2;
 
 	rv->pitch = rv->w * sample->format->BytesPerPixel;
 
@@ -929,11 +1071,11 @@ static SurfaceQueueEntry *decode_video_frame(MediaState *ms) {
 	sws_scale(
 		ms->sws,
 
-		(const uint8_t * const *) ms->video_decode_frame->data,
-		ms->video_decode_frame->linesize,
+		(const uint8_t * const *) sw_frame->data,
+		sw_frame->linesize,
 
 		0,
-		ms->video_decode_frame->height,
+		sw_frame->height,
 
 		surf_data,
 		surf_linesize
@@ -945,7 +1087,7 @@ static SurfaceQueueEntry *decode_video_frame(MediaState *ms) {
 
 static void decode_video(MediaState *ms) {
 	if (!ms->video_context) {
-		ms->video_finished = 1;
+		// Skip this frame and keep decoding.
 		return;
 	}
 
@@ -954,13 +1096,13 @@ static void decode_video(MediaState *ms) {
 	}
 
 	if (!ms->video_decode_frame) {
-		ms->video_finished = 1;
+		// Skip this frame and keep decoding.
 		return;
 	}
 
 	SDL_LockMutex(ms->lock);
 
-	if (!ms->video_finished && (ms->surface_queue_size < FRAMES)) {
+	while (!ms->video_finished && (ms->surface_queue_size < FRAMES)) {
 
 		SDL_UnlockMutex(ms->lock);
 
@@ -971,6 +1113,17 @@ static void decode_video(MediaState *ms) {
 		if (sqe) {
 			enqueue_surface(&ms->surface_queue, sqe);
 			ms->surface_queue_size += 1;
+		} else {
+			/* video_finished → EOF reached, stop decoding. */
+			if (ms->video_finished) {
+				break;
+			}
+			/* No more packets queued → can't make progress, stop. */
+			if (!ms->video_packet_queue.first) {
+				break;
+			}
+			/* Otherwise the frame was dropped (PTS behind real-time).
+			 * There may be more packets in the queue, so keep trying. */
 		}
 	}
 
@@ -1157,7 +1310,6 @@ static int decode_thread(void *arg) {
 
 	err = avformat_open_input(&ctx, ms->filename, NULL, NULL);
 	if (err) {
-		avformat_free_context(ctx);
 		ms->ctx = NULL;
 		goto finish;
 	}
@@ -1166,7 +1318,6 @@ static int decode_thread(void *arg) {
 	if (err) {
 		goto finish;
 	}
-
 
 	ms->video_stream = -1;
 	ms->audio_stream = -1;
@@ -1185,8 +1336,8 @@ static int decode_thread(void *arg) {
 		}
 	}
 
-	ms->video_context = find_context(ctx, ms->video_stream);
-	ms->audio_context = find_context(ctx, ms->audio_stream);
+	ms->video_context = find_context(ctx, ms->video_stream, &ms->hw_device_ctx);
+	ms->audio_context = find_context(ctx, ms->audio_stream, NULL);
 
 	ms->swr = swr_alloc();
 	if (ms->swr == NULL) {
@@ -1195,11 +1346,7 @@ static int decode_thread(void *arg) {
 
 	// Compute the number of samples we need to play back.
 	if (ms->audio_duration < 0) {
-#if (LIBAVFORMAT_VERSION_MAJOR < 62)
-		if (av_fmt_ctx_get_duration_estimation_method(ctx) != AVFMT_DURATION_FROM_BITRATE) {
-#else
 		if (ctx->duration_estimation_method != AVFMT_DURATION_FROM_BITRATE) {
-#endif
 
 			long long duration = ((long long) ctx->duration) * audio_sample_rate;
 			ms->audio_duration = (unsigned int) (duration /  AV_TIME_BASE);
@@ -1225,6 +1372,103 @@ static int decode_thread(void *arg) {
 	}
 
 	while (!ms->quit) {
+
+		/* ── Runtime seek ──────────────────────────────────
+		 * If media_seek() was called from another thread,
+		 * jump to the requested position without tearing down
+		 * the decode pipeline.
+		 */
+		if (ms->seek_req) {
+			double target = ms->seek_target;
+			ms->seek_req = 0;
+
+			/* Seek the demuxer to the target position. */
+			int seek_ret = av_seek_frame(ctx, -1,
+				(int64_t) (target * AV_TIME_BASE),
+				AVSEEK_FLAG_BACKWARD);
+
+			/* Drain stale packets from both queues. */
+			free_packet_queue(&ms->audio_packet_queue);
+			free_packet_queue(&ms->video_packet_queue);
+
+			/* Drain decoded audio frames. */
+			while (1) {
+				AVFrame *f = dequeue_frame(&ms->audio_queue);
+				if (!f) break;
+				av_frame_free(&f);
+			}
+
+			/* Drain decoded video surfaces. */
+			while (1) {
+				SurfaceQueueEntry *sqe =
+					dequeue_surface(&ms->surface_queue);
+				if (!sqe) break;
+				if (sqe->pixels) {
+#ifdef USE_POSIX_MEMALIGN
+					free(sqe->pixels);
+#else
+					SDL_free(sqe->pixels);
+#endif
+				}
+				free(sqe);
+			}
+			SDL_LockMutex(ms->lock);
+			ms->surface_queue_size = 0;
+			SDL_UnlockMutex(ms->lock);
+
+			/* Flush decoder-internal buffers so old frames
+			 * aren't returned after the seek. */
+			if (ms->audio_context)
+				avcodec_flush_buffers(ms->audio_context);
+			if (ms->video_context)
+				avcodec_flush_buffers(ms->video_context);
+
+			/* Reset stream state.
+			 *
+			 * IMPORTANT: audio_read_samples must be 0 (not target*sr).
+			 * media_read_audio() computes remaining = (audio_duration -
+			 * audio_read_samples) * BPS.  Since audio_duration was just
+			 * reduced to the *remaining* samples after target, setting
+			 * audio_read_samples to target*sr would double-subtract and
+			 * underflow for any seek past the halfway point, producing
+			 * a negative length → memset() crash. */
+			ms->audio_finished = 0;
+			ms->video_finished = 0;
+			ms->audio_read_samples = 0;
+			ms->audio_queue_samples = 0;
+			if (ms->audio_out_frame) {
+				av_frame_free(&ms->audio_out_frame);
+				ms->audio_out_index = 0;
+			}
+
+			/* Recompute remaining duration from the full
+			 * file duration (ms->total_duration), NOT
+			 * from the already-reduced audio_duration.
+			 * Subtracting from audio_duration on every
+			 * seek causes it to decay to zero after a
+			 * few drags, which kills playback. */
+			if (ms->total_duration > 0) {
+				int full_samples =
+					(int) (ms->total_duration
+						* audio_sample_rate);
+				ms->audio_duration =
+					full_samples - (int)(target * audio_sample_rate);
+				if (ms->audio_duration <= 0)
+					ms->audio_duration = -1;
+			}
+
+			/* Reset the decode target so the queue refills. */
+			ms->audio_queue_target_samples = 0;
+			ms->needs_decode = 1;
+
+			/* Reset video frame pacing so frames from the new
+			 * position are not discarded as stale.  Without this,
+			 * loop-seek frames would all be dropped because their
+			 * PTS (relative to the old playback) appears to be
+			 * before video_read_time. */
+			ms->video_pts_offset = 0.0;
+			ms->video_read_time = 0.0;
+		}
 
 		if (! ms->audio_finished) {
 			decode_audio(ms);
@@ -1321,7 +1565,6 @@ static int decode_sync_start(void *arg) {
 
 	err = avformat_open_input(&ctx, ms->filename, NULL, NULL);
 	if (err) {
-		avformat_free_context(ctx);
 		ms->ctx = NULL;
 		media_read_sync_finish(ms);
 	}
@@ -1349,8 +1592,8 @@ static int decode_sync_start(void *arg) {
 		}
 	}
 
-	ms->video_context = find_context(ctx, ms->video_stream);
-	ms->audio_context = find_context(ctx, ms->audio_stream);
+	ms->video_context = find_context(ctx, ms->video_stream, &ms->hw_device_ctx);
+	ms->audio_context = find_context(ctx, ms->audio_stream, NULL);
 
 	ms->swr = swr_alloc();
 	if (ms->swr == NULL) {
@@ -1359,11 +1602,7 @@ static int decode_sync_start(void *arg) {
 
 	// Compute the number of samples we need to play back.
 	if (ms->audio_duration < 0) {
-#if (LIBAVFORMAT_VERSION_MAJOR < 62)
-		if (av_fmt_ctx_get_duration_estimation_method(ctx) != AVFMT_DURATION_FROM_BITRATE) {
-#else
 		if (ctx->duration_estimation_method != AVFMT_DURATION_FROM_BITRATE) {
-#endif
 
 			long long duration = ((long long) ctx->duration) * audio_sample_rate;
 			ms->audio_duration = (unsigned int) (duration /  AV_TIME_BASE);
@@ -1602,6 +1841,32 @@ void media_want_video(MediaState *ms, int video) {
 	ms->want_video = 1;
 	ms->frame_drops = (video != 2);
 }
+
+
+/**
+ * Requests a runtime seek to `position` seconds within the currently playing
+ * stream.  This avoids tearing down and rebuilding the entire decode pipeline
+ * (which would re-open, re-decrypt, and re-parse the file).  Instead, it
+ * signals the decode thread to call av_seek_frame() on the already-open
+ * AVFormatContext.
+ *
+ * Safe to call from any thread.  The seek is processed asynchronously by the
+ * decode thread on its next loop iteration.
+ */
+void media_seek(struct MediaState *ms, double position) {
+	SDL_LockMutex(ms->lock);
+
+	ms->seek_req = 1;
+	ms->seek_target = position;
+
+	/* Wake up the decode thread so it processes the seek immediately,
+	 * even if it was blocked on needs_decode / cond_wait. */
+	ms->needs_decode = 1;
+	SDL_CondBroadcast(ms->cond);
+
+	SDL_UnlockMutex(ms->lock);
+}
+
 
 void media_pause(MediaState *ms, int pause) {
     if (pause && (ms->pause_time == 0)) {

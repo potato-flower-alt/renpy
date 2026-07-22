@@ -1,5 +1,6 @@
 # Copyright 2014 Patrick Dawson <pat@dw.is>
 # Copyright 2014 Tom Rothamel <tom@rothamel.us>
+# Modified in 2026 by the Ren'Py fork contributors: borderless fullscreen state.
 #
 # This software is provided 'as-is', without any express or implied
 # warranty.  In no event will the authors be held liable for any damages
@@ -33,5 +34,14 @@ cdef class Window:
 
     # The flags the window was created with.
     cdef Uint32 create_flags
+
+    # True when Windows fullscreen desktop is implemented as a borderless
+    # window instead of SDL fullscreen.
+    cdef bint borderless_fullscreen
+    cdef bint saved_window_bounds
+    cdef int windowed_x
+    cdef int windowed_y
+    cdef int windowed_w
+    cdef int windowed_h
 
 cdef Window main_window = None
