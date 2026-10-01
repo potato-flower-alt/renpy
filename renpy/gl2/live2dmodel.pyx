@@ -23,6 +23,7 @@ from libc.stdint cimport intptr_t
 from libc.stdlib cimport malloc, free
 from libc.string cimport memcpy
 from libc.stdio cimport printf
+from libc.math cimport floor, ceil
 
 from renpy.gl2.gl2mesh import TEXTURE_LAYOUT
 from renpy.gl2.gl2mesh2 cimport Mesh2
@@ -404,6 +405,8 @@ cdef class Live2DModel:
 
         cdef int i
         cdef int j
+        cdef double w, h, offset_x, offset_y, ppu
+        cdef double left, top, right, bottom, x, y
 
         cdef Render r
         cdef Render m
@@ -419,6 +422,10 @@ cdef class Live2DModel:
         w = self.pixel_size.X * zoom
         h = self.pixel_size.Y * zoom
 
+        rv = Render(w, h)
+        if w <= 0 or h <= 0:
+            return rv
+
         offset_x = self.pixel_origin.X * zoom
         offset_y = self.pixel_origin.Y * zoom
 
@@ -427,11 +434,10 @@ cdef class Live2DModel:
         reverse = Matrix.offset(offset_x, offset_y, 0.0) * Matrix.scale(ppu, -ppu, 1.0)
         forward = reverse.inverse()
 
-        rv = Render(w, h)
-
         renders = [ ]
         raw_renders = [ ]
         mask_renders = [ ]
+        mask_bounds = [ ]
 
         cdef csmVector4 multiply
         cdef csmVector4 screen
@@ -461,6 +467,7 @@ cdef class Live2DModel:
 
             if not is_visible and not is_mask:
                 mask_renders.append(None)
+                mask_bounds.append(None)
                 raw_renders.append(None)
 
                 continue
@@ -502,8 +509,22 @@ cdef class Live2DModel:
 
                 mask_renders.append(mr)
 
+                # Masks are rasterized into separate textures. Keep their
+                # bounds in model pixels so a small eye/mouth mask does not
+                # allocate and clear a texture the size of the whole model.
+                left, top, right, bottom = w, h, 0, 0
+                for j in range(self.drawable_vertex_counts[i]):
+                    x = offset_x + self.drawable_vertex_positions[i][j].X * ppu
+                    y = offset_y - self.drawable_vertex_positions[i][j].Y * ppu
+                    left = min(left, x)
+                    top = min(top, y)
+                    right = max(right, x)
+                    bottom = max(bottom, y)
+                mask_bounds.append((left, top, right, bottom))
+
             else:
                 mask_renders.append(None)
+                mask_bounds.append(None)
 
             if is_visible:
 
@@ -542,6 +563,7 @@ cdef class Live2DModel:
                 raw_renders.append(None)
 
         multi_masks = { }
+        cropped_masks = { }
 
         for i in range(self.drawable_count):
 
@@ -558,7 +580,8 @@ cdef class Live2DModel:
                 continue
 
             if self.drawable_mask_counts[i] == 1:
-                m = mask_renders[self.drawable_masks[i][0]]
+                key = (self.drawable_masks[i][0],)
+                m = mask_renders[key[0]]
 
             else:
 
@@ -579,6 +602,32 @@ cdef class Live2DModel:
 
                     multi_masks[key] = m
 
+            cropped = cropped_masks.get(key)
+            if cropped is None:
+                left, top, right, bottom = w, h, 0, 0
+                for j in key:
+                    bounds = mask_bounds[j]
+                    left = min(left, bounds[0])
+                    top = min(top, bounds[1])
+                    right = max(right, bounds[2])
+                    bottom = max(bottom, bounds[3])
+
+                # Leave transparent texels around the geometry for bilinear
+                # filtering, and preserve the original model-canvas clipping.
+                left = max(0, floor(left) - 2)
+                top = max(0, floor(top) - 2)
+                right = min(w, ceil(right) + 2)
+                bottom = min(h, ceil(bottom) + 2)
+                if right > left and bottom > top:
+                    m = m.subsurface((left, top, right - left, bottom - top), subpixel=True)
+                    bounds = (left / w, top / h, (right - left) / w, (bottom - top) / h)
+                else:
+                    m = Render(1, 1)
+                    bounds = (0.0, 0.0, 1.0 / w, 1.0 / h)
+                cropped = cropped_masks[key] = (m, bounds)
+
+            m, bounds = cropped
+
             if self.drawable_constant_flags[i] & csmIsInvertedMask:
 
                 shaders = inverted_mask_shaders
@@ -590,6 +639,7 @@ cdef class Live2DModel:
 
             r.add_uniform("u_live2d_ppu", ppu)
             r.add_uniform("u_live2d_offset", (offset_x, offset_y))
+            r.add_uniform("u_live2d_mask_bounds", bounds)
 
             r.blit(m, (0, 0))
 

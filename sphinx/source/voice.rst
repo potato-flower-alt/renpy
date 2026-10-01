@@ -104,6 +104,41 @@ It works just the same for automatic voice, as long as the filepath of the
 translation file starting from :file:`game/tl/{<language>}/` matches the filepath of
 the original file starting from :file:`game/`\ .
 
+Voice Speed
+-----------
+
+On native platforms, voices can play at 0.5 to 3.0 times their normal speed
+while preserving pitch. The default is 1.0. The selected speed is a persistent
+player preference and is not reverted by rollback or loading a save.
+
+To add the control to an existing preferences screen::
+
+    if config.has_voice and not renpy.variant("web"):
+        label _("Voice Speed")
+        bar value Preference("voice speed")
+        text "[preferences.voice_speed:.2f]×"
+        textbutton _("Normal Speed") action Preference("voice speed", 1.0)
+
+Buttons may also select a specific speed with ``Preference("voice speed", 1.5)``.
+Scripts can use :func:`renpy.set_voice_speed` and :func:`renpy.get_voice_speed`.
+To choose a game-specific initial preference::
+
+    default preferences.voice_speed = 1.0
+
+Each play or queue request captures the selected speed. Changes apply to new
+requests, including voice replay and character voice samples. Playing and
+already queued files keep their original speed. This applies only to the
+standard ``voice`` channel; music, sound effects, movie channels and system
+self-voicing are unaffected. On Web, voices always play at normal speed.
+
+Position, duration, ``<from>`` / ``<to>`` offsets, and seek targets remain in
+seconds of the original file. Auto-forward waits for actual playback to end,
+including the normal voice delay. Fade durations remain in real seconds.
+
+Native SDKs must be rebuilt with the matching audio extension and FFmpeg's
+``atempo`` filter enabled. Replacing Python scripts alone does not add native
+time-stretching support.
+
 Voice Functions
 ---------------
 

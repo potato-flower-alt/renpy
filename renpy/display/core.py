@@ -406,6 +406,8 @@ class Renderer:
 
         `flip`
             If True, the drawing will be presented to the user.
+
+        Returns True if a frame was successfully presented to the window.
         """
 
     def render_to_texture(self, what, alpha):
@@ -547,6 +549,9 @@ class Interface:
         # PNG data and the surface for the current file screenshot.
         self.screenshot = None
         self.screenshot_surface = None
+
+        # Starting the renderer does not necessarily render a frame.
+        self.surftree = None
 
         self.old_scene = {}
         self.transition = {}
@@ -755,6 +760,9 @@ class Interface:
         # The cursor cache.
         self.cursor_cache: dict | None = None
 
+        # Native system cursors, indexed by Ren'Py mouse name.
+        self.system_cursor_cache: dict = {}
+
         # The old mouse.
         self.old_mouse = None
 
@@ -945,6 +953,13 @@ class Interface:
 
         pygame.event.get([pygame.MOUSEMOTION, pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP])
 
+        # Buttons use the platform's native hand cursor when Ren'Py is using
+        # system cursors. Unsupported platforms simply retain the arrow.
+        try:
+            self.system_cursor_cache["button"] = pygame.mouse.SystemCursor(pygame.mouse.SYSTEM_CURSOR_HAND)
+        except Exception:
+            self.system_cursor_cache.clear()
+
         # Create a cache of the mouse information.
         if renpy.config.mouse:
             self.cursor_cache = {}
@@ -1020,8 +1035,12 @@ class Interface:
 
     def after_first_frame(self):
         """
-        Called after the first frame has been drawn.
+        Called after the first frame has been presented to the window.
         """
+
+        if not renpy.mobile:
+            pygame.display.get_window().show()
+            self.force_redraw = True
 
         if renpy.android:
             from jnius import autoclass
@@ -1282,8 +1301,10 @@ class Interface:
             renpy.config.screen_height,
         )
 
+        presented = False
+
         if draw:
-            renpy.display.draw.draw_screen(surftree)
+            presented = renpy.display.draw.draw_screen(surftree)
 
         if renpy.emscripten:
             emscripten.sleep(0)
@@ -1301,7 +1322,7 @@ class Interface:
         self.surftree = surftree
         self.fullscreen_video = fullscreen_video
 
-        if self.first_frame:
+        if self.first_frame and presented:
             self.after_first_frame()
             self.first_frame = False
 
@@ -1323,8 +1344,8 @@ class Interface:
 
         self.clear_screenshot = False
 
-        # Do nothing before the first interaction.
-        if not self.started:
+        # The renderer may have started before the first frame was rendered.
+        if not self.started or self.surftree is None:
             return
 
         if background and not renpy.emscripten:
@@ -1394,6 +1415,9 @@ class Interface:
         Saves a full-size screenshot in the given filename.
         """
 
+        if not self.started or self.surftree is None:
+            return False
+
         window = renpy.display.draw.screenshot(self.surftree)
 
         if renpy.config.screenshot_crop:
@@ -1418,8 +1442,8 @@ class Interface:
 
         self.clear_screenshot = False
 
-        # Do nothing before the first interaction.
-        if not self.started:
+        # The renderer may have started before the first frame was rendered.
+        if not self.started or self.surftree is None:
             return
 
         surf = renpy.display.draw.screenshot(self.surftree)
@@ -1720,8 +1744,8 @@ class Interface:
         """
         Sets the current mouse cursor.
 
-        True sets a visible system cursor. False hides the cursor. A ColorCursor
-        object sets a cursor image.
+        True sets the default visible system cursor. False hides the cursor. A
+        cursor object selects a native system cursor or a cursor image.
         """
 
         if cursor is self.old_mouse:
@@ -1844,16 +1868,17 @@ class Interface:
             self.set_mouse(False)
             return
 
-        # Deal with a hardware mouse, the easy way.
-        if self.cursor_cache is None:
-            self.set_mouse(True)
-            return
+        # Use native system cursors when no image cursor is configured, or when
+        # the system cursor preference is enabled.
+        if self.cursor_cache is None or renpy.game.preferences.system_cursor:
+            for mouse_kind in self.get_mouse_names():
+                if mouse_kind in self.system_cursor_cache:
+                    cursor = self.system_cursor_cache[mouse_kind]
+                    break
+            else:
+                cursor = True
 
-        # Use hardware mouse if the preferences force.
-        if renpy.game.preferences.system_cursor:
-            if isinstance(self.old_mouse, pygame.mouse.ColorCursor):
-                pygame.mouse.reset()
-            self.set_mouse(True)
+            self.set_mouse(cursor)
             return
 
         for mouse_kind in self.get_mouse_names():
@@ -3177,6 +3202,10 @@ class Interface:
 
                 # Handle focus notifications.
                 if ev.type == pygame.ACTIVEEVENT:
+                    # A desktop window intentionally starts hidden. Do not
+                    # suspend playback while it is preparing its first frame.
+                    startup_hidden = self.first_frame and not renpy.mobile
+
                     if ev.state & 1:
                         if not ev.gain:
                             renpy.display.focus.clear_focus()
@@ -3189,7 +3218,11 @@ class Interface:
                     if ev.state & 2:
                         self.keyboard_focused = ev.gain
 
-                        if not renpy.game.preferences.audio_when_unfocused and not renpy.emscripten:
+                        if (
+                            not startup_hidden
+                            and not renpy.game.preferences.audio_when_unfocused
+                            and not renpy.emscripten
+                        ):
                             if not ev.gain:
                                 renpy.audio.audio.pause_all()
                             else:
@@ -3197,7 +3230,11 @@ class Interface:
 
                     # If the window becomes inactive as a result of this event
                     # pause the audio according to preference
-                    if not renpy.game.preferences.audio_when_minimized and not renpy.emscripten:
+                    if (
+                        not startup_hidden
+                        and not renpy.game.preferences.audio_when_minimized
+                        and not renpy.emscripten
+                    ):
                         if not pygame.display.get_active() and not self.audio_paused:
                             renpy.audio.audio.pause_all()
                             self.audio_paused = True

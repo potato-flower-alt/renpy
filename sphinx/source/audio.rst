@@ -11,7 +11,7 @@ using the following audio file formats:
 * MP3
 * MP2
 * FLAC
-* WAV (uncompressed 16-bit signed PCM only)
+* WAV (uncompressed 16-bit or 24-bit signed PCM)
 
 On the web browser, Ren'Py will check a list of audio formats, and
 enable a mode that is faster and less prone to skipping if the web

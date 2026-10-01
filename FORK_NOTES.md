@@ -16,6 +16,25 @@ integrity tables, and commercial SDK binaries are not present in Git history.
 - Borderless fullscreen support on Windows.
 - Resource-type-aware language selection for images, audio, and text.
 - Preference/default initialization and execution lifecycle improvements.
+- Pitch-preserving voice and movie playback speed, including live speed
+  changes for silent movies and browser playback-rate handling.
+- YUV video rendering and reduced voice-related rendering/audio idle stalls.
+- Startup windows are revealed after the first presented frame.
+- Native system cursors and Cubism Core 5 R5 render-order compatibility.
+- Linux ARM/Steam ARM64 packaging and 24-bit PCM WAV regression coverage.
+
+## October 2026 synchronization
+
+Source changes through engine revision
+`294bdcb12` were synchronized on 2026-10-01, together with the companion
+build fork's changes through `aa1725b`. The runtime now requires FFmpeg's
+`libavfilter` for native pitch-preserving media playback. Regression tests
+and their synthetic media fixtures are included under `unittests/` and
+`testcases/`.
+
+The public commits retain the existing reconstructed history and publication
+cleanup. Private generated security data and commercial SDK binaries were
+excluded from this synchronization.
 
 ## Security-generated data
 
@@ -29,7 +48,7 @@ public `renpy-build` repository does not enable or link it.
 ## Licensing
 
 Most existing Ren'Py files retain their MIT notices. The modified
-`renpy/pygame/display.pyx` and `.pxd` files retain their zlib-license notices
-and are marked as altered. Fork-specific new code is covered by
+`renpy/pygame/display.pyx`, `display.pxd`, and `mouse.pyx` files retain their
+zlib-license notices and are marked as altered. Fork-specific new code is covered by
 `CUSTOM_LICENSE.md`. Distributed binaries still contain LGPL dependencies;
 see the companion build repository's `SOURCE_OFFER.md`.

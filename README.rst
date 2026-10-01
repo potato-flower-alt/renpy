@@ -78,7 +78,7 @@ Building the modules requires you have the many dependencies installed on
 your system. On Ubuntu and Debian, these dependencies can be installed with
 the command::
 
-    sudo apt install python3-dev libassimp-dev libavcodec-dev libavformat-dev \
+    sudo apt install python3-dev libassimp-dev libavcodec-dev libavformat-dev libavfilter-dev \
         libswresample-dev libswscale-dev libharfbuzz-dev libfreetype6-dev libfribidi-dev libsdl2-dev \
         libsdl2-image-dev libsdl2-gfx-dev libsdl2-mixer-dev libsdl2-ttf-dev libjpeg-dev pkg-config
 

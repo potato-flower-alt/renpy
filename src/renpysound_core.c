@@ -22,6 +22,7 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 */
 
 #include "renpysound_core.h"
+#include "ffmedia.h"
 #include <Python.h>
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_thread.h>
@@ -68,8 +69,16 @@ void media_sample_surfaces(SDL_Surface *rgb, SDL_Surface *rgba);
 MediaState *media_open(SDL_RWops *, const char *);
 void media_want_video(MediaState *, int);
 void media_start_end(MediaState *, double, double);
+void media_set_playback_speed(MediaState *, double);
+int media_set_video_speed(MediaState *, MediaState *, double);
+int media_video_speed_error(MediaState *);
+double media_video_position(MediaState *);
+void media_acquire_video(MediaState *);
+void media_release_video(MediaState *);
+double media_audio_position(MediaState *);
+int media_audio_finished(MediaState *);
 void media_start(MediaState *);
-void media_seek(MediaState *, double);
+double media_seek(MediaState *, double);
 void media_pause(MediaState *, int);
 void media_close(MediaState *);
 
@@ -99,6 +108,7 @@ static const char *error_msg = NULL;
 
 /* Have we been initialized? */
 static int initialized = 0;
+static int globally_paused = 0;
 
 /** Should fades be linear rather than logarithmic? */
 static int linear_fades = 0;
@@ -280,6 +290,10 @@ struct Channel {
      * can seek backwards and resume playback. */
     int playing_at_end;
 
+    /* Playback speed belongs to each stream, including a predecoded queue. */
+    double playing_speed;
+    double queued_speed;
+
     /* The event posted to the queue when we finish the playing stream. */
     int event;
 
@@ -339,6 +353,7 @@ static void start_stream(struct Channel* c, int reset_fade) {
 
     c->pos = 0;
     c->playing_at_end = 0;
+    media_pause(c->playing, c->paused || globally_paused);
     if (!c->queued) {
         c->playing_pad = audio_spec.freq * 2;
     }
@@ -446,7 +461,10 @@ static void callback(void *userdata, Uint8 *stream, int length) {
 
         struct Channel *c = &channels[channel];
 
-        if (! c->playing || c->paused) {
+        /* Keep completed streams available for seeking without polling their
+         * decoder queue. A seek clears playing_at_end; a newly queued stream
+         * must still be allowed to replace the completed one below. */
+        if (!c->playing || c->paused || (c->playing_at_end && !c->queued)) {
             c->last_playing = 0;
             continue;
         }
@@ -455,6 +473,9 @@ static void callback(void *userdata, Uint8 *stream, int length) {
 
             // How much do we have left to mix on this channel?
             int mixleft = length - mixed;
+            if (c->stop_samples > 0 && mixleft > c->stop_samples) {
+                mixleft = c->stop_samples;
+            }
 
             // The number of samples that we read.
             int read_length;
@@ -462,6 +483,12 @@ static void callback(void *userdata, Uint8 *stream, int length) {
             // Decode some amount of data.
             read_length = media_read_audio(c->playing, (Uint8 *) stream_buffer, mixleft * 2 * sizeof(short));
             read_length /= (2 * sizeof(short));
+
+            /* A starved decoder is not an end of stream. Output silence for
+             * this callback without advancing the source position. */
+            if (!read_length && c->stop_samples != 0 && !media_audio_finished(c->playing)) {
+                break;
+            }
 
             // If we're done with this stream, skip to the next.
             if (c->stop_samples == 0 || read_length == 0) {
@@ -511,6 +538,7 @@ static void callback(void *userdata, Uint8 *stream, int length) {
                     c->playing_tight = c->queued_tight;
                     c->playing_start_ms = c->queued_start_ms;
                     c->playing_relative_volume = c->queued_relative_volume;
+                    c->playing_speed = c->queued_speed;
                     c->playing_synchro_start = c->queued_synchro_start;
 
                     c->playing_audio_filter = c->queued_audio_filter;
@@ -625,8 +653,10 @@ static int check_channel(int c) {
     }
 
     if (c >= num_channels) {
+        LOCK_AUDIO();
         struct Channel *extended_channels = realloc(channels, sizeof(struct Channel) * (c + 1));
         if (extended_channels == NULL) {
+            UNLOCK_AUDIO();
             error(RPS_ERROR);
             error_msg = "Unable to allocate additional channels.";
             return -1;
@@ -647,6 +677,7 @@ static int check_channel(int c) {
         }
 
         num_channels = c + 1;
+        UNLOCK_AUDIO();
     }
 
     return 0;
@@ -657,7 +688,7 @@ static int check_channel(int c) {
  * Loads the provided stream. Returns the stream on success, NULL on
  * failure.
  */
-struct MediaState *load_stream(SDL_RWops *rw, const char *ext, double start, double end, int video) {
+struct MediaState *load_stream(SDL_RWops *rw, const char *ext, double start, double end, int video, double playback_speed, double video_playback_speed) {
     struct MediaState *rv;
     rv = media_open(rw, ext);
     if (rv == NULL)
@@ -665,17 +696,21 @@ struct MediaState *load_stream(SDL_RWops *rw, const char *ext, double start, dou
         return NULL;
     }
     media_start_end(rv, start, end);
+    media_set_playback_speed(rv, playback_speed);
 
     if (video) {
         media_want_video(rv, video);
     }
 
+    /* Install pending/loop requests before the decoder or mixer can start.
+     * This changes only the video clock; audio tempo remains immutable. */
+    if (video_playback_speed > 0) media_set_video_speed(rv, NULL, video_playback_speed);
     media_start(rv);
     return rv;
 }
 
 
-void RPS_play(int channel, SDL_RWops *rw, const char *ext, const char *name, int synchro_start, int fadein, int tight, double start, double end, float relative_volume, PyObject *audio_filter) {
+void RPS_play(int channel, SDL_RWops *rw, const char *ext, const char *name, int synchro_start, int fadein, int tight, double start, double end, float relative_volume, PyObject *audio_filter, double playback_speed, double video_playback_speed) {
 
     struct Channel *c;
 
@@ -720,7 +755,8 @@ void RPS_play(int channel, SDL_RWops *rw, const char *ext, const char *name, int
 
     /* Allocate playing sample. */
 
-    c->playing = load_stream(rw, ext, start, end, c->video);
+    c->playing = load_stream(rw, ext, start, end, c->video, playback_speed, video_playback_speed);
+    c->playing_speed = video_playback_speed > 0 ? video_playback_speed : playback_speed;
 
     if (! c->playing) {
         UNLOCK_AUDIO();
@@ -750,7 +786,7 @@ void RPS_play(int channel, SDL_RWops *rw, const char *ext, const char *name, int
     error(SUCCESS);
 }
 
-void RPS_queue(int channel, SDL_RWops *rw, const char *ext, const char *name, int synchro_start, int fadein, int tight, double start, double end, float relative_volume, PyObject *audio_filter) {
+void RPS_queue(int channel, SDL_RWops *rw, const char *ext, const char *name, int synchro_start, int fadein, int tight, double start, double end, float relative_volume, PyObject *audio_filter, double playback_speed, double video_playback_speed) {
 
     struct Channel *c;
 
@@ -762,11 +798,11 @@ void RPS_queue(int channel, SDL_RWops *rw, const char *ext, const char *name, in
 
     /* If we're not playing, then we should play instead of queue. */
     if (!c->playing) {
-        RPS_play(channel, rw, ext, name, synchro_start, fadein, tight, start, end, relative_volume, audio_filter);
+        RPS_play(channel, rw, ext, name, synchro_start, fadein, tight, start, end, relative_volume, audio_filter, playback_speed, video_playback_speed);
         return;
     }
 
-    MediaState *ms = load_stream(rw, ext, start, end, c->video);
+    MediaState *ms = load_stream(rw, ext, start, end, c->video, playback_speed, video_playback_speed);
 
     LOCK_AUDIO();
 
@@ -787,6 +823,7 @@ void RPS_queue(int channel, SDL_RWops *rw, const char *ext, const char *name, in
 
     /* Allocate queued sample. */
     c->queued = ms;
+    c->queued_speed = video_playback_speed > 0 ? video_playback_speed : playback_speed;
 
     if (! c->queued) {
         UNLOCK_AUDIO();
@@ -848,13 +885,37 @@ void RPS_seek(int channel, double position) {
         /* Reset the position counter to match the seek target.
          * Without this, RPS_get_pos() would keep reporting the
          * pre-seek position because c->pos was never updated. */
-        c->pos = (int)(position * audio_spec.freq);
-        c->playing_start_ms = 0;
-
-        media_seek(c->playing, position);
+        position = media_seek(c->playing, position);
+        c->pos = 0;
+        c->playing_start_ms = (int) (position * 1000);
     }
 
     UNLOCK_AUDIO();
+}
+
+/* Update both live and predecoded streams without touching decoder state. */
+int RPS_set_playback_speed(int channel, double speed) {
+    if (check_channel(channel)) return -1;
+    LOCK_AUDIO();
+    struct Channel *c = &channels[channel];
+    int supported = c->video && media_set_video_speed(c->playing, c->queued, speed);
+    if (supported) {
+        if (c->playing) c->playing_speed = speed;
+        if (c->queued) c->queued_speed = speed;
+    }
+    UNLOCK_AUDIO();
+    error(SUCCESS);
+    return supported;
+}
+
+double RPS_get_playback_speed(int channel) {
+    if (check_channel(channel)) return 1.0;
+    LOCK_AUDIO();
+    struct Channel *c = &channels[channel];
+    double speed = c->playing ? c->playing_speed : 1.0;
+    UNLOCK_AUDIO();
+    error(SUCCESS);
+    return speed;
 }
 
 
@@ -1093,11 +1154,13 @@ void RPS_pause(int channel, int pause) {
 
     c = &channels[channel];
 
+    LOCK_AUDIO();
     c->paused = pause;
 
     if (c->playing) {
-        media_pause(c->playing, pause);
+        media_pause(c->playing, pause || globally_paused);
     }
+    UNLOCK_AUDIO();
 
     error(SUCCESS);
 
@@ -1110,13 +1173,15 @@ void RPS_pause(int channel, int pause) {
 void RPS_global_pause(int pause) {
     int i;
 
-    SDL_PauseAudio(pause);
-
+    LOCK_AUDIO();
+    globally_paused = pause;
     for (i = 0; i < num_channels; i++) {
         if (channels[i].playing) {
-            media_pause(channels[i].playing, pause);
+            media_pause(channels[i].playing, pause || channels[i].paused);
         }
     }
+    UNLOCK_AUDIO();
+    SDL_PauseAudio(pause);
 }
 
 
@@ -1136,7 +1201,14 @@ int RPS_get_pos(int channel) {
     LOCK_NAME();
 
     if (c->playing) {
-        rv = samples_to_ms(c->pos) + c->playing_start_ms;
+        double video_position = c->video ? media_video_position(c->playing) : -1;
+        if (video_position >= 0) {
+            rv = (int) (video_position * 1000.0);
+        } else if (c->playing_speed != 1.0) {
+            rv = (int) (media_audio_position(c->playing) * 1000.0);
+        } else {
+            rv = samples_to_ms(c->pos) + c->playing_start_ms;
+        }
     } else {
         rv = -1;
     }
@@ -1315,20 +1387,26 @@ void RPS_replace_audio_filter(int channel, PyObject *new_filter, int primary) {
 PyObject *RPS_read_video(int channel) {
     struct Channel *c;
     SDL_Surface *surf = NULL;
+    MediaState *playing = NULL;
 
     if (check_channel(channel)) {
         Py_INCREF(Py_None);
         return Py_None;
     }
 
+    Py_BEGIN_ALLOW_THREADS
+    LOCK_AUDIO();
     c = &channels[channel];
-    MediaState *playing = c->playing;
-
-    if (playing) {
-        Py_BEGIN_ALLOW_THREADS
-        surf = media_read_video(playing);
-        Py_END_ALLOW_THREADS
+    if (c->playing && !c->paused && !globally_paused && !c->playing_synchro_start) {
+        playing = c->playing;
+        media_acquire_video(playing);
     }
+    UNLOCK_AUDIO();
+    if (playing) {
+        surf = media_read_video(playing);
+        media_release_video(playing);
+    }
+    Py_END_ALLOW_THREADS
 
     error(SUCCESS);
 
@@ -1341,6 +1419,67 @@ PyObject *RPS_read_video(int channel) {
 
 }
 
+
+static void RPS_video_yuv_capsule_destructor(PyObject *capsule) {
+    MediaVideoYUV *frame = PyCapsule_GetPointer(capsule, "renpy.videoyuv");
+
+    if (frame) {
+        media_free_video_yuv(frame);
+        PyMem_Free(frame);
+    }
+}
+
+
+PyObject *RPS_read_video_yuv(int channel) {
+    struct Channel *c;
+    MediaState *playing = NULL;
+    MediaVideoYUV *frame;
+    int got_frame;
+    PyObject *capsule;
+
+    if (check_channel(channel)) {
+        Py_INCREF(Py_None);
+        return Py_None;
+    }
+
+    frame = PyMem_Calloc(1, sizeof(*frame));
+    if (!frame) {
+        return PyErr_NoMemory();
+    }
+
+    Py_BEGIN_ALLOW_THREADS
+    LOCK_AUDIO();
+    c = &channels[channel];
+    got_frame = 0;
+    if (c->playing && !c->paused && !globally_paused && !c->playing_synchro_start) {
+        playing = c->playing;
+        media_acquire_video(playing);
+    }
+    UNLOCK_AUDIO();
+    if (playing) {
+        got_frame = media_read_video_yuv(playing, frame);
+        media_release_video(playing);
+    }
+    Py_END_ALLOW_THREADS
+
+    if (!got_frame) {
+        PyMem_Free(frame);
+        error(SUCCESS);
+        Py_INCREF(Py_None);
+        return Py_None;
+    }
+
+    capsule = PyCapsule_New(frame, "renpy.videoyuv", RPS_video_yuv_capsule_destructor);
+    if (!capsule) {
+        media_free_video_yuv(frame);
+        PyMem_Free(frame);
+        return NULL;
+    }
+
+    error(SUCCESS);
+    return capsule;
+}
+
 int RPS_video_ready(int channel) {
     struct Channel *c;
     int rv;
@@ -1349,13 +1488,17 @@ int RPS_video_ready(int channel) {
         return 1;
     }
 
+    LOCK_AUDIO();
     c = &channels[channel];
 
-    if (c->playing) {
+    if (c->paused || globally_paused || c->playing_synchro_start) {
+        rv = 0;
+    } else if (c->playing) {
         rv = media_video_ready(c->playing);
     } else {
         rv = 1;
     }
+    UNLOCK_AUDIO();
 
     error(SUCCESS);
 
@@ -1453,6 +1596,7 @@ void RPS_init(int freq, int stereo, int samples, int status, int equal_mono, int
     linear_fades = linear_fades_;
 
     initialized = 1;
+    globally_paused = 0;
 
     error(SUCCESS);
 }
@@ -1524,12 +1668,15 @@ static void handle_synchro_start() {
  * streams. */
 void RPS_periodic() {
 
+    error(SUCCESS);
+    LOCK_AUDIO();
     LOCK_NAME();
     handle_synchro_start();
 
     struct Dying *d = dying;
     dying = NULL;
     UNLOCK_NAME();
+    UNLOCK_AUDIO();
 
     while (d) {
         media_close(d->stream);
@@ -1541,6 +1688,18 @@ void RPS_periodic() {
 
         free(d);
         d = next_d;
+    }
+
+    LOCK_AUDIO();
+    int speed_error = 0;
+    for (int i = 0; i < num_channels; i++) {
+        speed_error |= media_video_speed_error(channels[i].playing);
+        speed_error |= media_video_speed_error(channels[i].queued);
+    }
+    UNLOCK_AUDIO();
+    if (speed_error) {
+        error(RPS_ERROR);
+        error_msg = "Live playback speed changes require a movie with no audio track.";
     }
 
 }

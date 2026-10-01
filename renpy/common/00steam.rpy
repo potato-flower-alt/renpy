@@ -1046,7 +1046,9 @@ init -1499 python in achievement:
             if steamapi.SteamUtils().IsSteamInBigPictureMode():
                 config.variants.insert(0, "steam_big_picture")
 
-            if steamapi.SteamUtils().IsSteamRunningOnSteamDeck():
+            steam_hardware = steamapi.SteamUtils().IsRunningOnSteamHardware()
+
+            if steam_hardware.value == steamapi.k_ESteamHardwareTypeSteamDeck.value:
                 config.variants.insert(0, "steam_deck")
 
                 if "large" in config.variants:

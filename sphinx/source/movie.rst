@@ -109,6 +109,52 @@ behavior of Ren'Py when displaying movies with different framerates is
 undefined, but will likely include a significant amount of frame drop.
 
 
+Playback Speed
+--------------
+
+Pass ``playback_speed`` to :func:`Movie`, :func:`renpy.movie_cutscene`, or
+:func:`renpy.music.play` and :func:`renpy.music.queue` on a movie channel::
+
+    image fast_movie = Movie(play="intro.webm", playback_speed=2.0)
+
+    label intro:
+        $ renpy.movie_cutscene("intro.webm", playback_speed=1.5)
+        $ renpy.music.play("background.webm", channel="movie", playback_speed=0.5)
+
+The supported range is 0.5 to 3.0, inclusive. The default is 1.0. Sound is
+time-stretched to preserve pitch; silent movies and separate mask movies
+also follow the selected speed. On Web, the browser controls video speed
+and pitch preservation.
+
+Queueing a new file does not change the current file's speed. To change an
+already playing **silent** Movie on native platforms, use::
+
+    $ renpy.music.set_playback_speed(0.5, channel="title_rain_outer")
+    $ speed = renpy.music.get_playback_speed(channel="title_rain_outer")
+    $ renpy.music.set_playback_speed(1.0, channel="title_rain_outer")
+
+This changes the current video clock immediately, retaining the decoder,
+playback position, decoded frames, and displayed texture. Repeating the same
+rate does nothing. The rate also applies to pending playback requests,
+predecoded queued files, and subsequent loops. Pausing freezes the clock
+without resetting the rate. Stopping clears it, and a new independent
+``play`` uses its own ``playback_speed``. The getter returns the requested
+rate before decoding starts, and 1.0 after stopping.
+
+Only the named channel changes. ``side_mask=True`` remains synchronized
+because color and mask share the same frame. A separate mask channel must
+be controlled separately. Live changes require a movie with no audio track;
+they do not support live audio time stretching or the Web backend. An
+audio-bearing file is rejected after its stream metadata becomes available.
+
+``renpy.music.get_pos``, ``renpy.music.get_duration``, ``renpy.music.seek``,
+and the ``<from>`` / ``<to>`` modifiers use original source seconds.
+Explicit cutscene delays and audio fades use real seconds.
+
+Native builds require the updated native decoder with FFmpeg's ``atempo``
+filter enabled; updating Python scripts alone is insufficient.
+
+
 Python Functions
 ----------------
 

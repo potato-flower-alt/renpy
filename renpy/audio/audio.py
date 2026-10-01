@@ -137,13 +137,16 @@ class QueueEntry(object):
 
     audio_filter = None
 
-    def __init__(self, filename, fadein, tight, loop, relative_volume, audio_filter):
+    playback_speed = 1.0
+
+    def __init__(self, filename, fadein, tight, loop, relative_volume, audio_filter, playback_speed=1.0):
         self.filename = filename
         self.fadein = fadein
         self.tight = tight
         self.loop = loop
         self.relative_volume = relative_volume
         self.audio_filter = audio_filter
+        self.playback_speed = playback_speed
 
 
 class MusicContext(renpy.revertable.RevertableObject):
@@ -157,6 +160,7 @@ class MusicContext(renpy.revertable.RevertableObject):
 
     pause = False
     last_relative_volume = 1.0
+    last_playback_speed = None
     audio_filter = None
     raw_audio_filter = None
 
@@ -232,6 +236,10 @@ class Channel(object):
     # The audio filter to use.
     audio_filter = None
     raw_audio_filter = None
+    loop_playback_speed = None
+    live_playback_speed = None
+    requested_playback_speed = None
+    playback_speed_pending = False
 
     def __init__(
         self,
@@ -591,6 +599,8 @@ class Channel(object):
                         end=end,
                         relative_volume=topq.relative_volume * filename_volume * renpy.config.adjust_audio_amplitude,
                         audio_filter=topq.audio_filter,
+                        playback_speed=topq.playback_speed,
+                        video_playback_speed=self.live_playback_speed,
                     )  # type:ignore
                 else:
                     renpysound.queue(
@@ -604,8 +614,11 @@ class Channel(object):
                         end=end,
                         relative_volume=topq.relative_volume * filename_volume * renpy.config.adjust_audio_amplitude,
                         audio_filter=topq.audio_filter,
+                        playback_speed=topq.playback_speed,
+                        video_playback_speed=self.live_playback_speed,
                     )  # type:ignore
 
+                self.playback_speed_pending = False
                 self.playing = True
                 self.synchro_start = False
 
@@ -628,9 +641,20 @@ class Channel(object):
             if self.loop:
                 for i in self.loop:
                     if topq is not None:
-                        newq = QueueEntry(i, 0, topq.tight, True, topq.relative_volume, self.context.audio_filter)
+                        newq = QueueEntry(
+                            i,
+                            0,
+                            topq.tight,
+                            True,
+                            topq.relative_volume,
+                            self.context.audio_filter,
+                            self.loop_playback_speed if self.loop_playback_speed is not None else topq.playback_speed,
+                        )
                     else:
-                        newq = QueueEntry(i, 0, False, True, 1.0, self.context.audio_filter)
+                        speed = self.loop_playback_speed
+                        if speed is None:
+                            speed = self.get_playback_speed()
+                        newq = QueueEntry(i, 0, False, True, 1.0, self.context.audio_filter, speed)
 
                     self.queue.append(newq)
             # Try callback:
@@ -702,6 +726,9 @@ class Channel(object):
         """
 
         with lock:
+            self.live_playback_speed = None
+            self.requested_playback_speed = None
+            self.playback_speed_pending = False
             self.keep_queue = 0
             self.dequeue()
 
@@ -755,13 +782,70 @@ class Channel(object):
             else:
                 renpysound.replace_audio_filter(self.number, new_audio_filter, 0)
 
+    def get_playback_speed(self):
+        # The built-in "voice" channel can alias legacy numeric channel 2.
+        voice_channel = self.name == "voice" or self is channels.get("voice")
+        if voice_channel and self.movie == renpysound.NO_VIDEO and not renpy.emscripten:
+            return renpy.preferences.validate_voice_speed(renpy.game.preferences.voice_speed)
+        return 1.0
+
+    def get_requested_playback_speed(self):
+        """The rate requested for the active movie (1.0 after stop)."""
+        if renpy.emscripten:
+            raise NotImplementedError("Live movie playback speed changes require the native video backend.")
+        with lock:
+            if self.requested_playback_speed is None:
+                return 1.0
+            if self.live_playback_speed is not None:
+                return self.live_playback_speed
+            if pcm_ok and self._number is not None and not self.playback_speed_pending:
+                return renpysound.get_playback_speed(self.number)
+            return self.requested_playback_speed
+
+    def set_playback_speed(self, speed):
+        """Retarget a silent movie's clock, preserving its decoding state."""
+        speed = renpy.preferences.validate_playback_speed(speed)
+        with lock:
+            if self.movie == renpysound.NO_VIDEO:
+                raise ValueError("Live playback speed changes require a movie channel.")
+            if renpy.emscripten:
+                raise NotImplementedError("Live movie playback speed changes require the native video backend.")
+            if self.requested_playback_speed is None:
+                return
+            if speed == self.get_requested_playback_speed():
+                return
+            # Check native stream compatibility before updating Python state.
+            if pcm_ok and self._number is not None and not self.playback_speed_pending:
+                renpysound.set_playback_speed(self.number, speed)
+            self.live_playback_speed = speed
+            self.requested_playback_speed = speed
+            ctx = self.copy_context()
+            if self.loop:
+                ctx.last_playback_speed = speed
+            ctx.last_changed = self.last_changed = get_serial()
+
     def enqueue(
-        self, filenames, loop=True, synchro_start=None, fadein=0, tight=None, loop_only=False, relative_volume=1.0
+        self,
+        filenames,
+        loop=True,
+        synchro_start=None,
+        fadein=0,
+        tight=None,
+        loop_only=False,
+        relative_volume=1.0,
+        playback_speed=None,
     ):
         if synchro_start is None:
             synchro_start = self.default_synchro_start
 
         with lock:
+            if playback_speed is None:
+                playback_speed = self.get_playback_speed()
+            else:
+                playback_speed = renpy.preferences.validate_playback_speed(playback_speed)
+            if filenames and self.requested_playback_speed is None:
+                self.requested_playback_speed = playback_speed
+                self.playback_speed_pending = True
             for filename in filenames:
                 if renpy.exports.is_seen_allowed():
                     filename, _, _, _ = self.split_filename(filename, False)
@@ -774,7 +858,9 @@ class Channel(object):
                 self.keep_queue += 1
 
                 for filename in filenames:
-                    qe = QueueEntry(filename, fadein, tight, False, relative_volume, self.context.audio_filter)
+                    qe = QueueEntry(
+                        filename, fadein, tight, False, relative_volume, self.context.audio_filter, playback_speed
+                    )
                     self.queue.append(qe)
 
                     # Only fade the first thing in.
@@ -785,8 +871,10 @@ class Channel(object):
 
             if loop:
                 self.loop = list(filenames)
+                self.loop_playback_speed = playback_speed
             else:
                 self.loop = []
+                self.loop_playback_speed = None
 
         with periodic_condition:
             periodic_condition.notify()
@@ -888,6 +976,12 @@ class Channel(object):
             return None
 
         return renpysound.read_video(self.number)
+
+    def read_video_yuv(self):
+        if not pcm_ok:
+            return None
+
+        return renpysound.read_video_yuv(self.number)
 
     def playing_at_end(self):
         """
@@ -1369,7 +1463,10 @@ def interact():
                     c.set_audio_filter(ctx.raw_audio_filter, True)
 
                 if not c.name in renpy.display.video.last_channel_movie:
-                    if c.loop != filenames:
+                    speed = ctx.last_playback_speed
+                    if speed is None:
+                        speed = c.get_playback_speed()
+                    if c.loop != filenames or (filenames and c.loop_playback_speed != speed):
                         c.fadeout(max(renpy.config.context_fadeout_music, renpy.config.fadeout_audio))
 
                     if filenames:
@@ -1380,6 +1477,7 @@ def interact():
                             tight=tight,
                             fadein=renpy.config.context_fadein_music,
                             relative_volume=ctx.last_relative_volume,
+                            playback_speed=ctx.last_playback_speed,
                         )
 
                 c.last_changed = ctx.last_changed

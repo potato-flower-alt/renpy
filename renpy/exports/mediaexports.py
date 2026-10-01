@@ -26,7 +26,34 @@ import renpy
 from renpy.exports.commonexports import renpy_pure
 
 
-def movie_cutscene(filename, delay=None, loops=0, stop_music=True):
+def set_voice_speed(speed):
+    """
+    :doc: voice
+
+    Sets the persistent voice speed preference. `speed` must be a finite
+    number between 0.5 and 3.0, inclusive. The default is 1.0.
+
+    This preserves pitch and applies to subsequent playback requests on the
+    voice channel, including voice replay. Playing and queued files retain
+    their speed. This preference does not participate in rollback.
+
+    On Web, the preference is stored but voices continue to play at 1.0 speed.
+    """
+    renpy.game.preferences.voice_speed = renpy.preferences.validate_voice_speed(speed)
+
+
+def get_voice_speed():
+    """
+    :doc: voice
+
+    Returns the selected voice speed preference. This is the speed for new
+    playback requests, not necessarily the speed of the currently playing
+    voice. On Web, playback always uses 1.0 regardless of this preference.
+    """
+    return renpy.game.preferences.voice_speed
+
+
+def movie_cutscene(filename, delay=None, loops=0, stop_music=True, playback_speed=1.0):
     """
     :doc: movie_cutscene
 
@@ -46,16 +73,23 @@ def movie_cutscene(filename, delay=None, loops=0, stop_music=True):
     `loops`
         The number of extra loops to show, -1 to loop forever.
 
+    `playback_speed`
+        A finite number from 0.5 to 3.0, with 1.0 playing at normal speed.
+        Changes both video and audio speed while preserving audio pitch.
+        When `delay` is None, waits for playback at this speed to finish.
+        An explicit `delay` is still measured in real seconds.
+
     Returns True if the movie was terminated by the user, or False if the
     given delay elapsed uninterrupted.
     """
 
+    playback_speed = renpy.preferences.validate_playback_speed(playback_speed)
     renpy.exports.mode("movie")
 
     if stop_music:
         renpy.audio.audio.set_force_stop("music", True)
 
-    renpy.exports.movie_start_fullscreen(filename, loops=loops)
+    renpy.exports.movie_start_fullscreen(filename, loops=loops, playback_speed=playback_speed)
 
     renpy.ui.saybehavior()
 

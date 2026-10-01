@@ -50,6 +50,8 @@ or is stopped.
 
 from __future__ import print_function
 
+import renpy
+
 from libc.stdint cimport uintptr_t
 
 from renpy.pygame.rwobject cimport RWopsFromPython
@@ -57,9 +59,11 @@ from sdl2 cimport SDL_RWops
 
 cdef extern from "renpysound_core.h":
 
-    void RPS_play(int channel, SDL_RWops *rw, char *ext, char* name, int synchro_start, int fadein, int tight, double start, double end, float volume, object audio_filter)
-    void RPS_queue(int channel, SDL_RWops *rw, char *ext, char *name, int synchro_start, int fadein, int tight, double start, double end, float volume, object audio_filter)
+    void RPS_play(int channel, SDL_RWops *rw, char *ext, char* name, int synchro_start, int fadein, int tight, double start, double end, float volume, object audio_filter, double playback_speed, double video_playback_speed)
+    void RPS_queue(int channel, SDL_RWops *rw, char *ext, char *name, int synchro_start, int fadein, int tight, double start, double end, float volume, object audio_filter, double playback_speed, double video_playback_speed)
     void RPS_seek(int channel, double position)
+    int RPS_set_playback_speed(int channel, double speed)
+    double RPS_get_playback_speed(int channel)
     void RPS_stop(int channel)
     void RPS_dequeue(int channel, int even_tight)
     int RPS_queue_depth(int channel)
@@ -80,6 +84,7 @@ cdef extern from "renpysound_core.h":
     void RPS_advance_time()
     int RPS_video_ready(int channel)
     object RPS_read_video(int channel)
+    object RPS_read_video_yuv(int channel)
     int RPS_playing_at_end(int channel)
     void RPS_set_video(int channel, int video)
 
@@ -114,7 +119,7 @@ def check_error():
         raise Exception(unicode(e, "utf-8", "replace"))
 
 
-def play(channel, file, name, synchro_start=False, fadein=0, tight=False, start=0, end=0, relative_volume=1.0, audio_filter=None):
+def play(channel, file, name, synchro_start=False, fadein=0, tight=False, start=0, end=0, relative_volume=1.0, audio_filter=None, playback_speed=1.0, video_playback_speed=None):
     """
     Plays `file` on `channel`. This clears the playing and queued samples and
     replaces them with this file.
@@ -147,6 +152,10 @@ def play(channel, file, name, synchro_start=False, fadein=0, tight=False, start=
 
     cdef SDL_RWops *rw
 
+    playback_speed = renpy.preferences.validate_playback_speed(playback_speed)
+    video_playback_speed = (renpy.preferences.validate_playback_speed(video_playback_speed)
+                            if video_playback_speed is not None else 0.0)
+
     if audio_filter is not None:
         audio_filter.prepare(get_sample_rate())
 
@@ -161,11 +170,11 @@ def play(channel, file, name, synchro_start=False, fadein=0, tight=False, start=
         tight = 0
 
     name = name.encode("utf-8")
-    RPS_play(channel, rw, name, name, synchro_start, fadein * 1000, tight, start, end, relative_volume, audio_filter)
+    RPS_play(channel, rw, name, name, synchro_start, fadein * 1000, tight, start, end, relative_volume, audio_filter, playback_speed, video_playback_speed)
     check_error()
 
 
-def queue(channel, file, name, synchro_start=False, fadein=0, tight=False, start=0, end=0, relative_volume=1.0, audio_filter=None):
+def queue(channel, file, name, synchro_start=False, fadein=0, tight=False, start=0, end=0, relative_volume=1.0, audio_filter=None, playback_speed=1.0, video_playback_speed=None):
     """
     Queues `file` on `channel` to play when the current file ends. If no file is
     playing, plays it.
@@ -175,6 +184,10 @@ def queue(channel, file, name, synchro_start=False, fadein=0, tight=False, start
 
     cdef SDL_RWops *rw
 
+    playback_speed = renpy.preferences.validate_playback_speed(playback_speed)
+    video_playback_speed = (renpy.preferences.validate_playback_speed(video_playback_speed)
+                            if video_playback_speed is not None else 0.0)
+
     if audio_filter is not None:
         audio_filter.prepare(get_sample_rate())
 
@@ -189,7 +202,7 @@ def queue(channel, file, name, synchro_start=False, fadein=0, tight=False, start
         tight = 0
 
     name = name.encode("utf-8")
-    RPS_queue(channel, rw, name, name, synchro_start, fadein * 1000, tight, start, end, relative_volume, audio_filter)
+    RPS_queue(channel, rw, name, name, synchro_start, fadein * 1000, tight, start, end, relative_volume, audio_filter, playback_speed, video_playback_speed)
     check_error()
 
 
@@ -220,6 +233,20 @@ def seek(channel, position):
 
     RPS_seek(channel, position)
     check_error()
+
+
+def set_playback_speed(channel, speed):
+    speed = renpy.preferences.validate_playback_speed(speed)
+    supported = RPS_set_playback_speed(channel, speed)
+    check_error()
+    if not supported:
+        raise ValueError("Live playback speed changes require a movie with no audio track.")
+
+
+def get_playback_speed(channel):
+    speed = RPS_get_playback_speed(channel)
+    check_error()
+    return speed
 
 
 def dequeue(channel, even_tight=False):
@@ -426,6 +453,12 @@ def read_video(channel):
     return rv.subsurface((FRAME_PADDING, FRAME_PADDING, w - FRAME_PADDING * 2, h - FRAME_PADDING * 2))
 
 
+def read_video_yuv(channel):
+    """Returns a capsule containing a packed YUV420 frame, or None."""
+
+    return RPS_read_video_yuv(channel)
+
+
 def playing_at_end(channel):
     """
     Returns true if the audio playing on `channel` has reached its natural
@@ -513,6 +546,7 @@ def periodic():
     """
 
     RPS_periodic()
+    check_error()
 
 
 def advance_time():

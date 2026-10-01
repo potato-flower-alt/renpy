@@ -707,7 +707,8 @@ class SWDraw(object):
         scaled_width = int(width * scale_factor)
         scaled_height = int(height * scale_factor)
 
-        self.screen = pygame.display.set_mode((scaled_width, scaled_height), 0, 32)
+        flags = pygame.WINDOW_HIDDEN if renpy.display.interface.first_frame and not renpy.mobile else 0
+        self.screen = pygame.display.set_mode((scaled_width, scaled_height), flags, 32)
 
         if scale_factor != 1.0:
             self.window = surface(width, height, True)
@@ -818,7 +819,7 @@ class SWDraw(object):
 
     def draw_screen(self, surftree):
         """
-        Draws the screen.
+        Draws the screen, returning True if a window frame was presented.
         """
 
         updates = []
@@ -837,6 +838,8 @@ class SWDraw(object):
             renpy.display.scale.smoothscale(self.window, self.screen.get_size(), self.screen)
 
             pygame.display.flip()
+
+        return True
 
     def render_to_texture(self, render, alpha):
         rv = surface(render.width, render.height, alpha)

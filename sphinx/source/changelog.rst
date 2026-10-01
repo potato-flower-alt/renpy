@@ -53,6 +53,12 @@ The ability to create these updates will be removed in Ren'Py 8.7.0.
 
 Ren'Py's PC presplash system has been updated to support WEBP and AVIF images, in addition to PNG and JPG.
 
+Steam Support
+-------------
+
+Ren'Py now uses and requires Steamworks SDK 1.65. Linux aarch64 builds now include the
+Steamworks redistributable library.
+
 
 .. _renpy-8.5.2:
 

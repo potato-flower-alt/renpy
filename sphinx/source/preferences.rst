@@ -24,6 +24,15 @@ can then change it again.)
     a click will end auto-forward mode. The equivalent of the "auto-forward
     after click" preference.
 
+.. var:: preferences.voice_speed = 1.0
+
+    The pitch-preserving speed for new playback requests on the voice channel,
+    between 0.5 and 3.0. Playing and queued files retain their previous speed.
+    Use ``Preference("voice speed")`` for a slider, or
+    ``Preference("voice speed", 1.5)`` to select a speed. This preference is
+    saved independently of game saves and rollback. Web playback remains at
+    1.0. See :doc:`voice`.
+
 .. var:: preferences.afm_enable = False
 
     If True, auto-forward move is enabled, otherwise False. The equivalent

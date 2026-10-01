@@ -159,6 +159,9 @@ init -1500 python:
         * Preference("voice sustain", "disable") - Don't sustain voice past the current interaction.
         * Preference("voice sustain", "toggle")  - Toggle voice sustain.
 
+        * Preference("voice speed", 1.5) - Set pitch-preserving voice speed (0.5 to 3.0).
+          Applies to new playback requests on native platforms.
+
         * Preference("music mute", "enable") - Mute the music mixer.
         * Preference("music mute", "disable") - Un-mute the music mixer.
         * Preference("music mute", "toggle") - Toggle music mute.
@@ -265,6 +268,7 @@ init -1500 python:
         * Preference("music volume")
         * Preference("sound volume")
         * Preference("voice volume")
+        * Preference("voice speed") - A slider from 0.5 to 3.0 in steps of 0.05.
         * Preference("mixer <mixer> volume")
         * Preference("self voicing volume drop")
         * Preference("font size")
@@ -429,6 +433,14 @@ init -1500 python:
                     return SetField(_preferences, "wait_voice", False)
                 elif value == "toggle":
                     return ToggleField(_preferences, "wait_voice")
+
+            elif name == _("voice speed"):
+
+                if value is None:
+                    return FieldValue(_preferences, "voice_speed", min=0.5, max=3.0,
+                        step=0.05, force_step=True, style="slider")
+                else:
+                    return SetField(_preferences, "voice_speed", renpy.preferences.validate_voice_speed(value))
 
             elif name == _("voice sustain"):
 

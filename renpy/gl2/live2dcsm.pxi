@@ -204,7 +204,13 @@ def load(dll):
     global csmGetDrawableRenderOrders
     csmGetDrawableRenderOrders = <csmGetDrawableRenderOrdersType> load_live2d_function(object, "csmGetDrawableRenderOrders")
     if not csmGetDrawableRenderOrders:
-        raise Exception("csmGetDrawableRenderOrders not found in Live2D dll " + dll.decode() + ". (The dll could be an old version.)")
+        # Cubism Core 5 R5 renamed csmGetDrawableRenderOrders to
+        # csmGetRenderOrders without changing its signature. Prefer the old
+        # name so older Cubism Core releases remain compatible, then fall
+        # back to the new export.
+        csmGetDrawableRenderOrders = <csmGetDrawableRenderOrdersType> load_live2d_function(object, "csmGetRenderOrders")
+    if not csmGetDrawableRenderOrders:
+        raise Exception("csmGetDrawableRenderOrders/csmGetRenderOrders not found in Live2D dll " + dll.decode() + ". (The dll could be an old version.)")
     global csmGetDrawableOpacities
     csmGetDrawableOpacities = <csmGetDrawableOpacitiesType> load_live2d_function(object, "csmGetDrawableOpacities")
     if not csmGetDrawableOpacities:

@@ -97,6 +97,7 @@ def fix_dlc(name, fn):
     u.add_dlc_state(name)
 
 fix_dlc("steam", "lib/py3-linux-x86_64/libsteam_api.so")
+fix_dlc("steam", "lib/py3-linux-aarch64/libsteam_api.so")
 fix_dlc("steam", "lib/py2-linux-x86_64/libsteam_api.so")
 fix_dlc("web", "web")
 fix_dlc("rapt", "rapt")

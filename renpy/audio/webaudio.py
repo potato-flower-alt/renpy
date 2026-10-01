@@ -141,6 +141,8 @@ def play(
     end=0,
     relative_volume=1.0,
     audio_filter=None,
+    playback_speed=1.0,
+    video_playback_speed=None,
 ):
     """
     Plays `file` on `channel`. This clears the playing and queued samples and
@@ -173,6 +175,9 @@ def play(
         The audio filter to apply when the file is being played.
     """
 
+    if video_playback_speed is not None:
+        raise NotImplementedError("Live movie playback speed changes require the native video backend.")
+
     try:
         if not isinstance(file, str):
             file = file.raw.name
@@ -187,7 +192,7 @@ def play(
     afid = load_audio_filter(audio_filter)
 
     call("stop", channel)
-    call("queue", channel, file, name, synchro_start, fadein, tight, start, end, relative_volume, afid)
+    call("queue", channel, file, name, synchro_start, fadein, tight, start, end, relative_volume, afid, playback_speed)
 
 
 @proxy_with_channel
@@ -202,6 +207,8 @@ def queue(
     end=0,
     relative_volume=1.0,
     audio_filter=None,
+    playback_speed=1.0,
+    video_playback_speed=None,
 ):
     """
     Queues `file` on `channel` to play when the current file ends. If no file is
@@ -209,6 +216,9 @@ def queue(
 
     The other arguments are as for play.
     """
+
+    if video_playback_speed is not None:
+        raise NotImplementedError("Live movie playback speed changes require the native video backend.")
 
     try:
         if not isinstance(file, str):
@@ -223,7 +233,7 @@ def queue(
 
     afid = load_audio_filter(audio_filter)
 
-    call("queue", channel, file, name, synchro_start, fadein, tight, start, end, relative_volume, afid)
+    call("queue", channel, file, name, synchro_start, fadein, tight, start, end, relative_volume, afid, playback_speed)
 
 
 @proxy_with_channel

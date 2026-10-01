@@ -516,6 +516,7 @@ init -1500 python hide:
         if config.skipping:
             renpy.sound.stop(channel="voice")
             _invoke_voice_callbacks("stop")
+            _voice.playing_info = None
 
         _voice.play = None
         _voice.sustain = False
@@ -558,7 +559,10 @@ init -1500 python hide:
     config.voice_tag_callback = voice_tag_callback
 
     def _voice_periodic_callback():
-        if _voice.playing_info is not None and not renpy.sound.is_playing(channel="voice"):
+        if _voice.playing_info is not None and (
+            not renpy.sound.is_playing(channel="voice")
+            or renpy.audio.audio.get_channel("voice").playing_at_end()
+        ):
             _invoke_voice_callbacks("stop")
             _voice.playing_info = None
 

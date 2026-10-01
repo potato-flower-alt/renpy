@@ -228,7 +228,8 @@ cdef class Window:
             if pos != (SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED):
                 SDL_SetWindowPosition(self.window, pos[0], pos[1])
 
-            SDL_ShowWindow(self.window)
+            if not (self.create_flags & SDL_WINDOW_HIDDEN):
+                SDL_ShowWindow(self.window)
 
         if not self.window:
             raise error()
@@ -511,6 +512,13 @@ cdef class Window:
 
     def get_wm_info(self):
         return { }
+
+    def show(self):
+        """
+        Shows a window that was created with WINDOW_HIDDEN.
+        """
+
+        SDL_ShowWindow(self.window)
 
     def get_active(self):
         if SDL_GetWindowFlags(self.window) & (SDL_WINDOW_HIDDEN | SDL_WINDOW_MINIMIZED):

@@ -56,7 +56,7 @@ def movie_stop(clear=True, only_fullscreen=False):
     renpy.audio.music.stop(channel="movie", fadeout=0)
 
 
-def movie_start(filename, size=None, loops=0):
+def movie_start(filename, size=None, loops=0, playback_speed=1.0):
     """
     This starts a movie playing.
     """
@@ -77,10 +77,10 @@ def movie_start(filename, size=None, loops=0):
         loop = False
         filename = filename * (loops + 1)
 
-    renpy.audio.music.play(filename, channel="movie", loop=loop)
+    renpy.audio.music.play(filename, channel="movie", loop=loop, playback_speed=playback_speed)
 
 
-def movie_start_fullscreen(filename, size=None, loops=0):
+def movie_start_fullscreen(filename, size=None, loops=0, playback_speed=1.0):
     """
     Starts a movie playing in fullscreen mode. This handles oversampling for
     fullscreen movies.
@@ -89,7 +89,7 @@ def movie_start_fullscreen(filename, size=None, loops=0):
     if isinstance(filename, str):
         filename = find_oversampled_filename(filename)
 
-    movie_start(filename, size, loops)
+    movie_start(filename, size, loops, playback_speed=playback_speed)
 
 
 movie_start_displayable = movie_start
@@ -177,6 +177,19 @@ def get_movie_texture(channel, mask_channel=None, side_mask=False, mipmap=None):
         return get_movie_texture_web(channel, mask_channel, side_mask, mipmap)
 
     c = renpy.audio.music.get_channel(channel)
+
+    # Masks still need SDL surfaces. Ordinary desktop movies can upload
+    # YUV420 planes and perform color conversion in the fragment shader.
+    if not side_mask and not mask_channel:
+        from renpy.gl2 import gl2texture
+
+        yuv = c.read_video_yuv()
+        if yuv is not None:
+            tex = gl2texture.load_yuv420_frame(yuv, mipmap)
+            if tex is not None:
+                texture[channel] = tex
+                return tex, True
+
     surf = c.read_video()
 
     if side_mask:
@@ -370,9 +383,19 @@ def find_oversampled(new, filename):
 
 def default_play_callback(old, new):
     if new.mask:
-        renpy.audio.music.play(find_oversampled(new, new.mask), channel=new.mask_channel, loop=new.loop)
+        renpy.audio.music.play(
+            find_oversampled(new, new.mask),
+            channel=new.mask_channel,
+            loop=new.loop,
+            playback_speed=new.playback_speed,
+        )
 
-    renpy.audio.music.play(find_oversampled(new, new._play), channel=new.channel, loop=new.loop)
+    renpy.audio.music.play(
+        find_oversampled(new, new._play),
+        channel=new.channel,
+        loop=new.loop,
+        playback_speed=new.playback_speed,
+    )
 
 
 allocated_channels: set[str] = set()
@@ -384,7 +407,7 @@ mask channel.
 class Movie(renpy.display.displayable.Displayable):
     """
     :doc: movie
-    :args: (*, size=None, channel="movie", play=None, side_mask=False, mask=None, mask_channel=None, start_image=None, image=None, play_callback=None, loop=True, group=None, **properties)
+    :args: (*, size=None, channel="movie", play=None, side_mask=False, mask=None, mask_channel=None, start_image=None, image=None, play_callback=None, loop=True, group=None, playback_speed=1.0, **properties)
 
     This is a displayable that shows the current movie.
 
@@ -462,15 +485,25 @@ class Movie(renpy.display.displayable.Displayable):
 
             def play_callback(old, new):
 
-                renpy.music.play(new._play, channel=new.channel, loop=new.loop, synchro_start=True)
+                renpy.music.play(new._play, channel=new.channel, loop=new.loop,
+                                 synchro_start=True, playback_speed=new.playback_speed)
 
                 if new.mask:
-                    renpy.music.play(new.mask, channel=new.mask_channel, loop=new.loop, synchro_start=True)
+                    renpy.music.play(new.mask, channel=new.mask_channel, loop=new.loop,
+                                     synchro_start=True, playback_speed=new.playback_speed)
 
     `loop`
         If False, the movie will not loop. If `image` is defined, the image
         will be displayed when the movie ends. Otherwise, the displayable will
         become transparent.
+
+    `playback_speed`
+        A finite number from 0.5 to 3.0. The default, 1.0, plays at normal
+        speed. Applies to `play`, its loops, and any separate `mask` movie,
+        preserving audio pitch. Has no effect when `play` is None. A custom
+        `play_callback` must pass ``new.playback_speed`` to
+        :func:`renpy.music.play` for both channels. Showing a Movie with the
+        same file and a different speed restarts the file at the new speed.
 
     `group`
         If not None, this should be a string. If given, and if the movie has not
@@ -503,6 +536,7 @@ class Movie(renpy.display.displayable.Displayable):
 
     fullscreen = False
     channel = "movie"
+    playback_speed = 1.0
     _play = None
     _original_play = None
 
@@ -625,10 +659,12 @@ class Movie(renpy.display.displayable.Displayable):
         group=None,
         keep_last_frame=False,
         oversample=None,
+        playback_speed=1.0,
         **properties,
     ):
         global movie_channel_serial
 
+        self.playback_speed = renpy.preferences.validate_playback_speed(playback_speed)
         super(Movie, self).__init__(**properties)
 
         if channel == "movie" and play and renpy.config.single_movie_channel:
@@ -768,7 +804,11 @@ class Movie(renpy.display.displayable.Displayable):
         if (self._play is None) and (old_play is None):
             return
 
-        if (self._play != old_play) or renpy.config.replay_movie_sprites:
+        if (
+            (self._play != old_play)
+            or (old is not None and self.playback_speed != old.playback_speed)
+            or renpy.config.replay_movie_sprites
+        ):
             if self._play:
                 if self.play_callback is not None:
                     self.play_callback(old, self)

@@ -43,6 +43,7 @@ def play(
     tight=None,
     if_changed=False,
     relative_volume=1.0,
+    playback_speed=None,
 ):
     """
     :doc: audio
@@ -93,8 +94,23 @@ def play(
         specified, it will always default to 1.0, which plays the file at the
         original volume as determined by the mixer, channel and secondary volume.
 
+    `playback_speed`
+        A finite number from 0.5 to 3.0, with 1.0 playing at normal speed.
+        Audio preserves pitch, and movie frames follow the same speed.
+        None uses the voice speed preference for the voice channel and 1.0
+        for other channels. Web supports this for movies only.
+
+        The speed belongs to this playback request and its loops. With
+        `if_changed`, an already playing file keeps its current speed; the
+        new speed applies to subsequent loops. Positions, durations, and
+        filename time modifiers remain in source seconds. Fade times are
+        real seconds.
+
     This clears the pause flag for `channel`.
     """
+
+    if playback_speed is not None:
+        playback_speed = renpy.preferences.validate_playback_speed(playback_speed)
 
     if renpy.game.context().init_phase:
         raise Exception("Can't play music during init phase.")
@@ -148,6 +164,7 @@ def play(
                     tight=tight,
                     loop_only=loop_only,
                     relative_volume=relative_volume,
+                    playback_speed=playback_speed,
                 )
 
             t = get_serial()
@@ -158,10 +175,12 @@ def play(
                 ctx.last_filenames = filenames
                 ctx.last_tight = tight
                 ctx.last_relative_volume = relative_volume
+                ctx.last_playback_speed = playback_speed
             else:
                 ctx.last_filenames = []
                 ctx.last_tight = False
                 ctx.last_relative_volume = 1.0
+                ctx.last_playback_speed = None
 
             ctx.pause = False
 
@@ -170,7 +189,16 @@ def play(
                 raise
 
 
-def queue(filenames, channel="music", loop=None, clear_queue=True, fadein=0, tight=None, relative_volume=1.0):
+def queue(
+    filenames,
+    channel="music",
+    loop=None,
+    clear_queue=True,
+    fadein=0,
+    tight=None,
+    relative_volume=1.0,
+    playback_speed=None,
+):
     """
     :doc: audio
 
@@ -206,8 +234,15 @@ def queue(filenames, channel="music", loop=None, clear_queue=True, fadein=0, tig
         specified, it will always default to 1.0, which plays the file at the
         original volume as determined by the mixer, channel and secondary volume.
 
+    `playback_speed`
+        As for :func:`renpy.music.play`. Applies to these files and their
+        loops, without changing the speed of the currently playing file.
+
     This clears the pause flag for `channel`.
     """
+
+    if playback_speed is not None:
+        playback_speed = renpy.preferences.validate_playback_speed(playback_speed)
 
     if renpy.game.context().init_phase:
         raise Exception("Can't play music during init phase.")
@@ -244,7 +279,14 @@ def queue(filenames, channel="music", loop=None, clear_queue=True, fadein=0, tig
                 enqueue = True
 
             if enqueue:
-                c.enqueue(filenames, loop=loop, fadein=fadein, tight=tight, relative_volume=relative_volume)
+                c.enqueue(
+                    filenames,
+                    loop=loop,
+                    fadein=fadein,
+                    tight=tight,
+                    relative_volume=relative_volume,
+                    playback_speed=playback_speed,
+                )
 
             t = get_serial()
             ctx.last_changed = t
@@ -254,16 +296,55 @@ def queue(filenames, channel="music", loop=None, clear_queue=True, fadein=0, tig
                 ctx.last_filenames = filenames
                 ctx.last_tight = tight
                 ctx.last_relative_volume = relative_volume
+                ctx.last_playback_speed = playback_speed
             else:
                 ctx.last_filenames = []
                 ctx.last_tight = False
                 ctx.last_relative_volume = 1.0
+                ctx.last_playback_speed = None
 
             ctx.pause = False
 
         except Exception:
             if renpy.config.debug_sound:
                 raise
+
+
+def set_playback_speed(speed, channel="music"):
+    """
+    :doc: audio
+
+    Changes the playback clock of the current movie immediately. `speed`
+    must be a finite number from 0.5 to 3.0. Only native movie channels with
+    no audio track are supported, including movies using ``side_mask=True``.
+
+    The decoder, position, decoded frames, and displayed texture are retained.
+    The rate applies to the current request, already queued files, and future
+    loops. It also applies before the first frame is decoded. Pausing freezes
+    the clock and preserves the rate. Repeating the same rate does nothing.
+
+    This is a no-op on an idle channel. Stopping clears the request; a new
+    independent :func:`renpy.music.play` uses its own `playback_speed`.
+    Positions and durations remain in original video seconds. Other channels
+    are unaffected; a separate mask channel must be controlled separately.
+
+    An audio-bearing file is rejected when its stream metadata is available;
+    for a not-yet-opened file, this error is reported by the audio periodic
+    update after probing. Web live speed changes are not supported.
+    """
+    speed = renpy.preferences.validate_playback_speed(speed)
+    get_channel(channel).set_playback_speed(speed)
+
+
+def get_playback_speed(channel="music"):
+    """
+    :doc: audio
+
+    On native platforms, returns the requested playback rate for `channel`, including a
+    request whose first frame has not been decoded. Returns 1.0 after stop
+    or when idle. This does not advance, restart, or seek the movie.
+    """
+    return get_channel(channel).get_requested_playback_speed()
 
 
 def seek(position, channel="music"):

@@ -1,4 +1,5 @@
 # Copyright 2014 Patrick Dawson <pat@dw.is>
+# Modified in 2026 by the Ren'Py fork contributors: native system cursor support.
 #
 # This software is provided 'as-is', without any express or implied
 # warranty.  In no event will the authors be held liable for any damages
@@ -69,8 +70,35 @@ def set_cursor(size, hotspot, xormasks, andmasks):
 def get_cursor():
     return None
 
-# The ColorCursor that is currently in use.
+# Values accepted by SystemCursor. These mirror SDL_SystemCursor.
+SYSTEM_CURSOR_ARROW = SDL_SYSTEM_CURSOR_ARROW
+SYSTEM_CURSOR_HAND = SDL_SYSTEM_CURSOR_HAND
+
+# The cursor object that is currently in use.
 active_cursor = False
+
+cdef class SystemCursor(object):
+
+    cdef SDL_Cursor *cursor
+
+    def __cinit__(self):
+        self.cursor = NULL
+
+    def __init__(self, cursor):
+        self.cursor = SDL_CreateSystemCursor(<SDL_SystemCursor> cursor)
+
+        if self.cursor == NULL:
+            raise RuntimeError("Could not create system cursor.")
+
+    def __dealloc__(self):
+        if self.cursor != NULL:
+            SDL_FreeCursor(self.cursor)
+
+    def activate(self):
+        global active_cursor
+        if active_cursor is not self:
+            active_cursor = self
+            SDL_SetCursor(self.cursor)
 
 cdef class ColorCursor(object):
 

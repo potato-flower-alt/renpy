@@ -775,6 +775,17 @@ screen preferences():
 
                     bar value Preference("auto-forward time")
 
+                    if config.has_voice and not renpy.variant("web"):
+                        label _("Voice Speed")
+
+                        bar value Preference("voice speed")
+
+                        hbox:
+                            text "[preferences.voice_speed:.2f]×"
+                            textbutton _("Normal Speed") action Preference("voice speed", 1.0)
+
+                        text _("Applies to the next voice playback.")
+
                 vbox:
 
                     if config.has_music:

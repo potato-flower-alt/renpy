@@ -7,10 +7,20 @@
 #include <libavutil/hwcontext.h>
 #include <libswscale/swscale.h>
 
+#ifndef __EMSCRIPTEN__
+#include <libavfilter/avfilter.h>
+#include <libavfilter/buffersrc.h>
+#include <libavfilter/buffersink.h>
+#include <libavutil/opt.h>
+#endif
+
 #include <SDL2/SDL.h>
+
+#include "ffmedia.h"
 #include <SDL2/SDL_thread.h>
 
 #include <stdlib.h>
+#include <math.h>
 
 #ifndef _WIN32
 #define USE_POSIX_MEMALIGN
@@ -121,7 +131,11 @@ static void rwops_close(SDL_RWops *rw) {
 	rw->close(rw);
 }
 
-static double current_time = 0;
+/* Sample the same monotonic clock for scheduling, position and rate changes.
+ * A cached frame time is insufficient when the mixer advances between frames. */
+static double media_clock_now(void) {
+    return SPEED * av_gettime_relative() * 1e-6;
+}
 
 typedef struct PacketQueueEntry {
 	AVPacket *pkt;
@@ -143,6 +157,15 @@ typedef struct SurfaceQueueEntry {
 	struct SurfaceQueueEntry *next;
 
 	SDL_Surface *surf;
+
+	/* Packed YUV420 data for GPU conversion. */
+	int yuv;
+	int yuv_width, yuv_height;
+	int yuv_y_pitch, yuv_uv_pitch;
+	uint8_t *yuv_y;
+	uint8_t *yuv_uv;
+	int yuv_full_range;
+	int yuv_bt709;
 
 	/* The pts, converted to seconds. */
 	double pts;
@@ -205,6 +228,7 @@ typedef struct MediaState {
 	 * processed by the decode_thread loop.  When seek_req is non-zero,
 	 * the decoder flushes its queues and jumps to seek_target (seconds). */
 	int seek_req;
+	int seeking;
 	double seek_target;
 
 	/* Indexes of video and audio streams. */
@@ -251,6 +275,23 @@ typedef struct MediaState {
 	/* The number of samples that have been read so far. */
 	int audio_read_samples; // Lock
 
+    /* Immutable playback parameters. All times are in the source file. */
+    double playback_speed;
+    double audio_end;
+
+#ifndef __EMSCRIPTEN__
+    /* Owned by the decode thread. Output frames use the device sample rate. */
+    AVFilterGraph *tempo_graph;
+    AVFilterContext *tempo_source;
+    AVFilterContext *tempo_sink;
+    int tempo_eof;
+    int tempo_resampler_drained;
+    int64_t tempo_input_samples;
+    int64_t tempo_output_samples;
+    int64_t tempo_output_limit;
+    double tempo_decode_position;
+#endif
+
 	/* A frame that video is decoded into. */
 	AVFrame *video_decode_frame;
 
@@ -265,15 +306,24 @@ typedef struct MediaState {
 	/* Software rescaling context. */
 	struct SwsContext *sws;
 
+	/* Software rescaling context for surface consumers of YUV frames. */
+	struct SwsContext *yuv_sws;
+
 	/* A queue of decoded video frames. */
 	SurfaceQueueEntry *surface_queue; // Lock
 	int surface_queue_size; // Lock
 
-	/* The offset between a pts timestamp and realtime. */
-	double video_pts_offset;
-
-	/* The wall time the last video frame was read. */
-	double video_read_time;
+    /* Source-time clock. All fields are protected by lock. Queued frames
+     * always retain their original source PTS, including across rate changes. */
+    double video_clock_anchor;
+    double video_time_anchor;
+    double video_speed;
+    int video_clock_started;
+    int video_clock_ended;
+    int video_clock_only;
+    int stream_info_ready;
+    int video_speed_requested;
+    int video_readers;
 
 	/* Are frame drops allowed? */
 	int frame_drops;
@@ -281,14 +331,142 @@ typedef struct MediaState {
 	/* The time the pause happened, or 0 if we're not paused. */
 	double pause_time;
 
-	/* The offset between now and the time of the current frame, at least for video. */
-	double time_offset;
-
 } MediaState;
+
+/* The following helpers require ms->lock. */
+static double video_end_time(MediaState *ms) {
+    if (ms->audio_end >= 0) return ms->audio_end;
+    if (ms->stream_info_ready && ms->total_duration > 0) return ms->total_duration;
+    return -1;
+}
+
+static double video_time(MediaState *ms, double now) {
+    double position = ms->video_time_anchor;
+    if (ms->video_clock_started && !ms->video_clock_ended && !ms->pause_time && !ms->seek_req && !ms->seeking) {
+        position += fmax(0, now - ms->video_clock_anchor) * ms->video_speed;
+    }
+    double end = video_end_time(ms);
+    if (end >= 0) position = fmin(position, end);
+    return position;
+}
+
+static void video_start_clock(MediaState *ms, double now) {
+    if (!ms->video_clock_started && !ms->pause_time && !ms->seek_req && !ms->seeking) {
+        ms->video_clock_anchor = now;
+        ms->video_clock_started = 1;
+    }
+}
+
+static int video_clock_finished(MediaState *ms, double now) {
+    if (ms->video_clock_ended) return 1;
+    if (!ms->video_clock_started || ms->seek_req || ms->seeking) return 0;
+    double position = video_time(ms, now);
+    double end = video_end_time(ms);
+    if ((end >= 0 && position >= end) || (end < 0 && ms->video_finished && !ms->surface_queue_size)) {
+        ms->video_time_anchor = position;
+        ms->video_clock_anchor = now;
+        ms->video_clock_ended = 1;
+        return 1;
+    }
+    return 0;
+}
+
+/* Return -1 for streams that use the audio clock, including unopened streams. */
+double media_video_position(MediaState *ms) {
+    SDL_LockMutex(ms->lock);
+    double rv = ms->video_clock_only ? video_time(ms, media_clock_now()) : -1;
+    if (ms->video_clock_only && ms->seek_req) rv = ms->seek_target;
+    SDL_UnlockMutex(ms->lock);
+    return rv;
+}
+
+/* Pending requests may precede stream probing. They change only the video
+ * rate, never the immutable audio tempo. An incompatible stream is reported
+ * when its metadata is available (also checked by the mixer periodic call). */
+static int video_speed_supported(MediaState *ms) {
+    return !ms || (ms->want_video && (!ms->stream_info_ready || ms->video_clock_only));
+}
+
+int media_video_speed_error(MediaState *ms) {
+    if (!ms) return 0;
+    SDL_LockMutex(ms->lock);
+    int error = ms->video_speed_requested && !video_speed_supported(ms);
+    if (error) ms->video_speed_requested = 0;
+    SDL_UnlockMutex(ms->lock);
+    return error;
+}
+
+static void video_set_speed(MediaState *ms, double speed, double now) {
+    if (!ms) return;
+    ms->video_speed_requested = 1;
+    if (ms->video_speed == speed) return;
+    ms->video_time_anchor = video_time(ms, now);
+    ms->video_clock_anchor = now;
+    ms->video_speed = speed;
+}
+
+/* The mixer holds its audio lock so playing/queued cannot be replaced.
+ * Lock both streams before validating or updating either of them. */
+int media_set_video_speed(MediaState *playing, MediaState *queued, double speed) {
+    if (playing) SDL_LockMutex(playing->lock);
+    if (queued) SDL_LockMutex(queued->lock);
+    int supported = isfinite(speed) && speed >= 0.5 && speed <= 3.0 &&
+        video_speed_supported(playing) && video_speed_supported(queued);
+    if (supported) {
+        double now = media_clock_now();
+        video_set_speed(playing, speed, now);
+        video_set_speed(queued, speed, now);
+    }
+    if (queued) SDL_UnlockMutex(queued->lock);
+    if (playing) SDL_UnlockMutex(playing->lock);
+    return supported;
+}
+
+static void media_publish_stream_info(MediaState *ms) {
+    SDL_LockMutex(ms->lock);
+    ms->video_clock_only = ms->video_context && ms->audio_stream == -1;
+    ms->stream_info_ready = 1;
+    /* An early runtime request cannot change an audio-bearing movie's rate. */
+    if (!ms->video_clock_only) ms->video_speed = ms->playback_speed;
+    SDL_UnlockMutex(ms->lock);
+}
+
+/* Pin the stream while a renderer uses its conversion context. The mixer
+ * lock is needed only to acquire the pin, never during RGB conversion. */
+void media_acquire_video(MediaState *ms) {
+    SDL_LockMutex(ms->lock);
+    ms->video_readers++;
+    SDL_UnlockMutex(ms->lock);
+}
+
+void media_release_video(MediaState *ms) {
+    SDL_LockMutex(ms->lock);
+    ms->video_readers--;
+    if (ms->quit && !ms->video_readers) SDL_CondBroadcast(ms->cond);
+    SDL_UnlockMutex(ms->lock);
+}
 
 static AVFrame *dequeue_frame(FrameQueue *fq);
 static void free_packet_queue(PacketQueue *pq);
 static SurfaceQueueEntry *dequeue_surface(SurfaceQueueEntry **queue);
+
+static void free_surface_entry(SurfaceQueueEntry *sqe) {
+	if (!sqe) {
+		return;
+	}
+
+	if (sqe->pixels) {
+#ifndef USE_POSIX_MEMALIGN
+		SDL_free(sqe->pixels);
+#else
+		free(sqe->pixels);
+#endif
+	}
+
+	av_free(sqe->yuv_y);
+	av_free(sqe->yuv_uv);
+	av_free(sqe);
+}
 
 
 /* A queue of MediaState objects that are awaiting deallocation.*/
@@ -307,14 +485,7 @@ static void deallocate(MediaState *ms) {
 			break;
 		}
 
-		if (sqe->pixels) {
-#ifndef USE_POSIX_MEMALIGN
-			SDL_free(sqe->pixels);
-#else
-			free(sqe->pixels);
-#endif
-		}
-		av_free(sqe);
+		free_surface_entry(sqe);
 	}
 
 	if (ms->hw_frame) {
@@ -328,11 +499,18 @@ static void deallocate(MediaState *ms) {
 		sws_freeContext(ms->sws);
 	}
 
+	if (ms->yuv_sws) {
+		sws_freeContext(ms->yuv_sws);
+	}
+
 	if (ms->video_decode_frame) {
 		av_frame_free(&ms->video_decode_frame);
 	}
 
 	/* Destroy audio stuff. */
+#ifndef __EMSCRIPTEN__
+    avfilter_graph_free(&ms->tempo_graph);
+#endif
 	if (ms->swr) {
 		swr_free(&ms->swr);
 	}
@@ -539,6 +717,7 @@ static AVPacket *read_packet(MediaState *ms, PacketQueue *pq) {
 		}
 
 		if (av_read_frame(ms->ctx, pkt)) {
+			av_packet_free(&pkt);
 			return NULL;
 		}
 
@@ -745,7 +924,268 @@ fail:
 
 /* Audio decoding *************************************************************/
 
+#ifndef __EMSCRIPTEN__
+
+/* Time stretching produces a different number of samples from its input.
+ * Keep it on the decoder thread, ahead of the fixed-size mixer filters. */
+static int tempo_prepare(MediaState *ms) {
+    int ret;
+    char args[128];
+    AVFilterContext *previous;
+
+    ms->tempo_graph = avfilter_graph_alloc();
+    if (!ms->tempo_graph) return AVERROR(ENOMEM);
+    ms->tempo_graph->nb_threads = 1;
+
+    snprintf(args, sizeof(args),
+        "time_base=1/%d:sample_rate=%d:sample_fmt=s16:channel_layout=stereo",
+        audio_sample_rate, audio_sample_rate);
+    ret = avfilter_graph_create_filter(&ms->tempo_source,
+        avfilter_get_by_name("abuffer"), "voice_input", args, NULL, ms->tempo_graph);
+    if (ret < 0) return ret;
+    previous = ms->tempo_source;
+
+    int stages = ms->playback_speed > 2.0 ? 2 : 1;
+    double factor = stages == 2 ? sqrt(ms->playback_speed) : ms->playback_speed;
+    const AVFilter *filter = avfilter_get_by_name("atempo");
+    if (!filter) return AVERROR_FILTER_NOT_FOUND;
+
+    for (int i = 0; i < stages; i++) {
+        AVFilterContext *tempo;
+        snprintf(args, sizeof(args), "voice_tempo_%d", i);
+        ret = avfilter_graph_create_filter(&tempo, filter, args, NULL, NULL, ms->tempo_graph);
+        if (ret < 0) return ret;
+        ret = av_opt_set_double(tempo->priv, "tempo", factor, 0);
+        if (ret < 0) return ret;
+        ret = avfilter_link(previous, 0, tempo, 0);
+        if (ret < 0) return ret;
+        previous = tempo;
+    }
+
+    ret = avfilter_graph_create_filter(&ms->tempo_sink,
+        avfilter_get_by_name("abuffersink"), "voice_output", NULL, NULL, ms->tempo_graph);
+    if (ret < 0) return ret;
+    ret = avfilter_link(previous, 0, ms->tempo_sink, 0);
+    if (ret < 0) return ret;
+    return avfilter_graph_config(ms->tempo_graph, NULL);
+}
+
+static int tempo_drain(MediaState *ms) {
+    while (1) {
+        AVFrame *frame = av_frame_alloc();
+        if (!frame) return AVERROR(ENOMEM);
+        int ret = av_buffersink_get_frame(ms->tempo_sink, frame);
+        if (ret < 0) {
+            av_frame_free(&frame);
+            return (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) ? 0 : ret;
+        }
+
+        SDL_LockMutex(ms->lock);
+        if (ms->tempo_output_limit >= 0) {
+            int64_t remaining = ms->tempo_output_limit - ms->tempo_output_samples;
+            if (frame->nb_samples > remaining) frame->nb_samples = (int) remaining;
+        }
+        if (ms->seek_req || ms->quit || !frame->nb_samples) {
+            av_frame_free(&frame);
+        } else {
+            ms->tempo_output_samples += frame->nb_samples;
+            ms->audio_queue_samples += frame->nb_samples;
+            enqueue_frame(&ms->audio_queue, frame);
+        }
+        SDL_UnlockMutex(ms->lock);
+    }
+}
+
+static int tempo_feed(MediaState *ms, AVFrame *frame) {
+    if (!ms->tempo_graph) {
+        int ret = tempo_prepare(ms);
+        if (ret < 0) return ret;
+    }
+    if (frame) {
+        frame->pts = ms->tempo_input_samples;
+        SDL_LockMutex(ms->lock);
+        ms->tempo_input_samples += frame->nb_samples;
+        SDL_UnlockMutex(ms->lock);
+    }
+    int ret = av_buffersrc_add_frame_flags(ms->tempo_source, frame, AV_BUFFERSRC_FLAG_KEEP_REF);
+    if (ret < 0) return ret;
+    return tempo_drain(ms);
+}
+
+static AVFrame *tempo_frame(void) {
+    AVFrame *frame = av_frame_alloc();
+    if (frame) {
+        frame->sample_rate = audio_sample_rate;
+        frame->ch_layout = (AVChannelLayout) AV_CHANNEL_LAYOUT_STEREO;
+        frame->format = AV_SAMPLE_FMT_S16;
+    }
+    return frame;
+}
+
+/* Crop BEFORE stretching: both script offsets and seek targets are source
+ * times. A partially skipped frame is never exposed directly to the mixer. */
+static int tempo_convert(MediaState *ms, AVFrame *input) {
+    AVFrame *frame = tempo_frame();
+    if (!frame) return AVERROR(ENOMEM);
+    int ret;
+
+    if (input && input->ch_layout.order == AV_CHANNEL_ORDER_UNSPEC) {
+        av_channel_layout_default(&input->ch_layout, input->ch_layout.nb_channels);
+    }
+    if (input && !swr_is_initialized(ms->swr)) {
+        ret = swr_alloc_set_opts2(&ms->swr, &frame->ch_layout, frame->format, frame->sample_rate,
+            &input->ch_layout, input->format, input->sample_rate, 0, NULL);
+        if (ret < 0) goto done;
+        if (audio_equal_mono && input->ch_layout.nb_channels == 1) {
+            ret = swr_set_matrix(ms->swr, stereo_matrix, 1);
+            if (ret < 0) goto done;
+        }
+    }
+
+    double start = ms->tempo_decode_position;
+    if (input && input->best_effort_timestamp != AV_NOPTS_VALUE) {
+        start = input->best_effort_timestamp * av_q2d(ms->ctx->streams[ms->audio_stream]->time_base);
+        /* Account for samples still buffered in the resampler. */
+        start -= (double) swr_get_delay(ms->swr, audio_sample_rate) / audio_sample_rate;
+    }
+    ret = swr_convert_frame(ms->swr, frame, input);
+    if (ret < 0) goto done;
+    ms->tempo_decode_position = start + (double) frame->nb_samples / audio_sample_rate;
+
+    int first = (int) fmin(frame->nb_samples, fmax(0, llround((ms->skip - start) * audio_sample_rate)));
+    int last = frame->nb_samples;
+    if (ms->audio_end >= 0) {
+        last = (int) fmin(last, fmax(0, llround((ms->audio_end - start) * audio_sample_rate)));
+        if (ms->tempo_decode_position >= ms->audio_end) ms->tempo_eof = 1;
+    }
+
+    if (last > first) {
+        ret = av_frame_make_writable(frame);
+        if (ret < 0) goto done;
+        if (first) memmove(frame->data[0], frame->data[0] + first * BPS, (last - first) * BPS);
+        frame->nb_samples = last - first;
+        ret = tempo_feed(ms, frame);
+    }
+
+done:
+    av_frame_free(&frame);
+    return ret;
+}
+
+static void decode_audio_tempo(MediaState *ms) {
+    int ret = 0;
+    if (!ms->audio_decode_frame) ms->audio_decode_frame = av_frame_alloc();
+    if (!ms->audio_decode_frame) {
+        ret = AVERROR(ENOMEM);
+        goto finished;
+    }
+    if (!ms->audio_context) ms->tempo_eof = 1;
+
+    while (1) {
+        SDL_LockMutex(ms->lock);
+        int full = ms->audio_queue_samples >= audio_target_samples;
+        int interrupted = ms->seek_req || ms->quit;
+        SDL_UnlockMutex(ms->lock);
+        if (full || interrupted) return;
+
+        if (ms->tempo_eof) {
+            if (!ms->tempo_resampler_drained) {
+                ms->tempo_resampler_drained = 1;
+                if (swr_is_initialized(ms->swr)) {
+                    ret = tempo_convert(ms, NULL);
+                    if (ret < 0) goto finished;
+                }
+            }
+
+            /* Explicit <to> / <silence> padding is source audio and must
+             * pass through the stretcher as well. Never pad natural EOF
+             * to the container's (possibly estimated) original duration. */
+            int64_t remaining = ms->audio_end < 0 ? 0 :
+                llround(fmax(0, ms->audio_end - ms->skip) * audio_sample_rate) - ms->tempo_input_samples;
+            if (remaining > 0) {
+                AVFrame *silence = tempo_frame();
+                if (!silence) { ret = AVERROR(ENOMEM); goto finished; }
+                silence->nb_samples = (int) fmin(remaining, 4096);
+                ret = av_frame_get_buffer(silence, 0);
+                if (ret >= 0) {
+                    memset(silence->data[0], 0, silence->nb_samples * BPS);
+                    ret = tempo_feed(ms, silence);
+                }
+                av_frame_free(&silence);
+                if (ret < 0) goto finished;
+                continue;
+            }
+
+            if (ms->tempo_graph) {
+                /* atempo cannot flush an incomplete first analysis window.
+                 * Give very short clips lookahead, then discard the synthetic
+                 * tail. Padding is not counted as source audio or progress. */
+                if (!ms->tempo_output_samples && ms->tempo_input_samples) {
+                    ms->tempo_output_limit = llround(ms->tempo_input_samples / ms->playback_speed);
+                    if (!ms->tempo_output_limit) ms->tempo_output_limit = 1;
+                    AVFrame *padding = tempo_frame();
+                    if (!padding) { ret = AVERROR(ENOMEM); goto finished; }
+                    padding->pts = ms->tempo_input_samples;
+                    padding->nb_samples = audio_sample_rate / 4;
+                    ret = av_frame_get_buffer(padding, 0);
+                    if (ret >= 0) {
+                        memset(padding->data[0], 0, padding->nb_samples * BPS);
+                        ret = av_buffersrc_add_frame_flags(ms->tempo_source, padding, AV_BUFFERSRC_FLAG_KEEP_REF);
+                    }
+                    av_frame_free(&padding);
+                    if (ret < 0) goto finished;
+                    ret = tempo_drain(ms);
+                    if (ret < 0) goto finished;
+                }
+                ret = tempo_feed(ms, NULL);
+            }
+            goto finished;
+        }
+
+        ret = avcodec_receive_frame(ms->audio_context, ms->audio_decode_frame);
+        if (ret == AVERROR_EOF) {
+            ms->tempo_eof = 1;
+            continue;
+        }
+        if (ret == AVERROR(EAGAIN)) {
+            AVPacket *pkt = read_packet(ms, &ms->audio_packet_queue);
+            ret = avcodec_send_packet(ms->audio_context, pkt);
+            if (ret == 0) dequeue_packet(&ms->audio_packet_queue);
+            else if (ret != AVERROR(EAGAIN)) goto finished;
+            continue;
+        }
+        if (ret < 0) goto finished;
+
+        ret = tempo_convert(ms, ms->audio_decode_frame);
+        av_frame_unref(ms->audio_decode_frame);
+        if (ret < 0) goto finished;
+    }
+
+finished:
+    if (ret < 0) {
+        char message[AV_ERROR_MAX_STRING_SIZE];
+        av_strerror(ret, message, sizeof(message));
+        av_log(NULL, AV_LOG_ERROR, "[ffmedia] voice tempo (%s): %s\n", ms->filename, message);
+    }
+    SDL_LockMutex(ms->lock);
+    ms->audio_finished = 1;
+    SDL_UnlockMutex(ms->lock);
+}
+#endif
+
 static void decode_audio(MediaState *ms) {
+    if (ms->video_clock_only) {
+        SDL_LockMutex(ms->lock);
+        ms->audio_finished = 1;
+        SDL_UnlockMutex(ms->lock);
+        return;
+    }
+#ifndef __EMSCRIPTEN__
+    if (ms->playback_speed != 1.0) {
+        decode_audio_tempo(ms);
+        return;
+    }
+#endif
 	int ret;
 	AVPacket *pkt;
 	AVFrame *converted_frame;
@@ -891,6 +1331,12 @@ static enum AVPixelFormat get_pixel_format(SDL_Surface *surf) {
 }
 
 
+static void finish_video(MediaState *ms) {
+    SDL_LockMutex(ms->lock);
+    ms->video_finished = 1;
+    SDL_UnlockMutex(ms->lock);
+}
+
 static SurfaceQueueEntry *decode_video_frame(MediaState *ms) {
 	int ret;
 
@@ -926,7 +1372,7 @@ static SurfaceQueueEntry *decode_video_frame(MediaState *ms) {
 		// More input is needed.
 
 			if (ret == AVERROR_EOF) {
-				ms->video_finished = 1;
+				finish_video(ms);
 				return NULL;
 			}
 
@@ -962,19 +1408,11 @@ static SurfaceQueueEntry *decode_video_frame(MediaState *ms) {
 		return NULL;
 	}
 
-	// If we're behind on decoding the frame, drop it.
-	if (ms->video_pts_offset && (ms->video_pts_offset + pts < ms->video_read_time)) {
-
-		// If we're 5s behind, give up on video for the time being, so we don't
-		// blow out memory.
-		if (ms->video_pts_offset + pts < ms->video_read_time - 5.0) {
-			// Skip this frame and keep decoding.
-		}
-
-		if (ms->frame_drops) {
-		    return NULL;
-		}
-	}
+    SDL_LockMutex(ms->lock);
+    int drop = ms->frame_drops && ms->video_clock_started && !ms->pause_time &&
+        pts < video_time(ms, media_clock_now()) - frame_early_delivery * ms->video_speed;
+    SDL_UnlockMutex(ms->lock);
+    if (drop) return NULL;
 
 	// If this is a hardware frame, transfer it back to CPU memory.
 	AVFrame *sw_frame = ms->video_decode_frame;
@@ -998,6 +1436,60 @@ static SurfaceQueueEntry *decode_video_frame(MediaState *ms) {
 		}
 	}
 
+	if (sw_frame->format == AV_PIX_FMT_YUV420P ||
+		sw_frame->format == AV_PIX_FMT_YUVJ420P) {
+		int width = sw_frame->width;
+		int height = sw_frame->height;
+		int chroma_width = (width + 1) / 2;
+		int chroma_height = (height + 1) / 2;
+		SurfaceQueueEntry *rv = av_mallocz(sizeof(SurfaceQueueEntry));
+
+		if (!rv) {
+			finish_video(ms);
+			return NULL;
+		}
+
+		rv->yuv_y_pitch = width;
+		rv->yuv_uv_pitch = chroma_width * 2;
+		rv->yuv_y = av_malloc((size_t) width * height);
+		rv->yuv_uv = av_malloc((size_t) rv->yuv_uv_pitch * chroma_height);
+
+		if (!rv->yuv_y || !rv->yuv_uv) {
+			free_surface_entry(rv);
+			finish_video(ms);
+			return NULL;
+		}
+
+		for (int y = 0; y < height; y++) {
+			memcpy(
+				rv->yuv_y + (size_t) y * rv->yuv_y_pitch,
+				sw_frame->data[0] + y * sw_frame->linesize[0],
+				width
+			);
+		}
+
+		for (int y = 0; y < chroma_height; y++) {
+			const uint8_t *src_u = sw_frame->data[1] + y * sw_frame->linesize[1];
+			const uint8_t *src_v = sw_frame->data[2] + y * sw_frame->linesize[2];
+			uint8_t *dst_uv = rv->yuv_uv + (size_t) y * rv->yuv_uv_pitch;
+
+			for (int x = 0; x < chroma_width; x++) {
+				dst_uv[x * 2] = src_u[x];
+				dst_uv[x * 2 + 1] = src_v[x];
+			}
+		}
+
+		rv->yuv = 1;
+		rv->yuv_width = width;
+		rv->yuv_height = height;
+		rv->yuv_full_range =
+			sw_frame->color_range == AVCOL_RANGE_JPEG ||
+			sw_frame->format == AV_PIX_FMT_YUVJ420P;
+		rv->yuv_bt709 = sw_frame->colorspace == AVCOL_SPC_BT709;
+		rv->pts = pts;
+		return rv;
+	}
+
 	SDL_Surface *sample = rgba_surface;
 
 	if (ms->sws == NULL) {
@@ -1019,7 +1511,7 @@ static SurfaceQueueEntry *decode_video_frame(MediaState *ms) {
 
 
 		if (!ms->sws) {
-					ms->video_finished = 1;
+					finish_video(ms);
 					return NULL;
 		}
 
@@ -1038,9 +1530,10 @@ static SurfaceQueueEntry *decode_video_frame(MediaState *ms) {
 
 	SurfaceQueueEntry *rv = av_malloc(sizeof(SurfaceQueueEntry));
 	if (rv == NULL) {
-					ms->video_finished = 1;
+					finish_video(ms);
 					return NULL;
 	}
+	memset(rv, 0, sizeof(*rv));
 	rv->w = sw_frame->width + FRAME_PADDING * 2;
 	rv->h = sw_frame->height + FRAME_PADDING * 2;
 
@@ -1148,30 +1641,31 @@ int media_video_ready(struct MediaState *ms) {
 	int consumed = 0;
 	int rv = 0;
 
-	if (ms->video_stream == -1) {
-		return 1;
-	}
-
 	SDL_LockMutex(ms->lock);
 
 	if (!ms->ready) {
 		goto done;
 	}
 
-	if (ms->pause_time > 0) {
+    if (ms->video_stream == -1) {
+        rv = 1;
+        goto done;
+    }
+
+	if (ms->pause_time > 0 || ms->seek_req || ms->seeking) {
 	    goto done;
 	}
 
-	double offset_time = current_time - ms->time_offset;
+    double position = video_time(ms, media_clock_now());
 
 	/*
 	 * If we have an obsolete frame, drop it.
 	 */
-	if (ms->video_pts_offset) {
-		while (ms->surface_queue) {
+    if (ms->frame_drops && ms->video_clock_started) {
+        while (ms->surface_queue && ms->surface_queue->next) {
 
-			/* The PTS is greater that the last frame read, so we're good. */
-			if (ms->surface_queue->pts + ms->video_pts_offset >= ms->video_read_time) {
+			/* Keep the latest frame due on the same source clock. */
+            if (ms->surface_queue->next->pts > position) {
 				break;
 			}
 
@@ -1179,14 +1673,7 @@ int media_video_ready(struct MediaState *ms) {
 			SurfaceQueueEntry *sqe = dequeue_surface(&ms->surface_queue);
 			ms->surface_queue_size -= 1;
 
-			if (sqe->pixels) {
-#ifndef USE_POSIX_MEMALIGN
-				SDL_free(sqe->pixels);
-#else
-				free(sqe->pixels);
-#endif
-			}
-			av_free(sqe);
+			free_surface_entry(sqe);
 
 			consumed = 1;
 		}
@@ -1198,8 +1685,8 @@ int media_video_ready(struct MediaState *ms) {
 	 */
 
 	if (ms->surface_queue) {
-		if (ms->video_pts_offset) {
-			if (ms->surface_queue->pts + ms->video_pts_offset <= offset_time + frame_early_delivery) {
+		if (ms->video_clock_started) {
+            if (ms->surface_queue->pts <= position + frame_early_delivery * ms->video_speed) {
 				rv = 1;
 			}
 		} else {
@@ -1221,26 +1708,172 @@ done:
 }
 
 
+int media_read_video_yuv(MediaState *ms, MediaVideoYUV *rv) {
+	SurfaceQueueEntry *sqe = NULL;
+
+	memset(rv, 0, sizeof(*rv));
+
+	SDL_LockMutex(ms->lock);
+
+    if (!ms->ready || ms->video_stream == -1) goto done;
+
+	if (ms->pause_time > 0 || ms->seek_req || ms->seeking || !ms->surface_queue_size || !ms->surface_queue->yuv) {
+		goto done;
+	}
+
+    double now = media_clock_now();
+    if (!ms->video_clock_only && !ms->video_clock_started) ms->video_time_anchor = ms->surface_queue->pts;
+    video_start_clock(ms, now);
+    if (ms->surface_queue->pts <= video_time(ms, now) + frame_early_delivery * ms->video_speed) {
+		sqe = dequeue_surface(&ms->surface_queue);
+		ms->surface_queue_size -= 1;
+	}
+
+done:
+	if (sqe) {
+		ms->needs_decode = 1;
+		SDL_CondBroadcast(ms->cond);
+	}
+
+	SDL_UnlockMutex(ms->lock);
+
+	if (!sqe) {
+		return 0;
+	}
+
+	rv->width = sqe->yuv_width;
+	rv->height = sqe->yuv_height;
+	rv->y = sqe->yuv_y;
+	rv->uv = sqe->yuv_uv;
+	rv->full_range = sqe->yuv_full_range;
+	rv->bt709 = sqe->yuv_bt709;
+
+	sqe->yuv_y = NULL;
+	sqe->yuv_uv = NULL;
+	free_surface_entry(sqe);
+	return 1;
+}
+
+
+void media_free_video_yuv(MediaVideoYUV *frame) {
+	if (!frame) {
+		return;
+	}
+
+	av_free(frame->y);
+	av_free(frame->uv);
+	memset(frame, 0, sizeof(*frame));
+}
+
+
+static SDL_Surface *convert_yuv_surface(MediaState *ms, SurfaceQueueEntry *sqe) {
+	SDL_Surface *sample = rgba_surface;
+
+	ms->yuv_sws = sws_getCachedContext(
+		ms->yuv_sws,
+		sqe->yuv_width,
+		sqe->yuv_height,
+		AV_PIX_FMT_NV12,
+		sqe->yuv_width,
+		sqe->yuv_height,
+		get_pixel_format(sample),
+		SWS_POINT | SWS_FULL_CHR_H_INP | SWS_FULL_CHR_H_INT,
+		NULL,
+		NULL,
+		NULL
+	);
+
+	if (!ms->yuv_sws) {
+		return NULL;
+	}
+
+	int colorspace = sqe->yuv_bt709 ? SWS_CS_ITU709 : SWS_CS_DEFAULT;
+	int src_range = sqe->yuv_full_range ? 1 : 0;
+
+	sws_setColorspaceDetails(
+		ms->yuv_sws,
+		sws_getCoefficients(colorspace),
+		src_range,
+		sws_getCoefficients(SWS_CS_DEFAULT),
+		0,
+		0,
+		1 << 16,
+		1 << 16
+	);
+
+	int w = sqe->yuv_width + FRAME_PADDING * 2;
+	int h = sqe->yuv_height + FRAME_PADDING * 2;
+	int pitch = w * sample->format->BytesPerPixel;
+
+	if (pitch % ROW_ALIGNMENT) {
+		pitch += ROW_ALIGNMENT - (pitch % ROW_ALIGNMENT);
+	}
+
+	void *pixels;
+#ifndef USE_POSIX_MEMALIGN
+	pixels = SDL_calloc(pitch * h, 1);
+#else
+	if (posix_memalign(&pixels, ROW_ALIGNMENT, pitch * h)) {
+		return NULL;
+	}
+	memset(pixels, 0, pitch * h);
+#endif
+
+	uint8_t *surf_pixels = (uint8_t *) pixels;
+	uint8_t *surf_data[] = {
+		&surf_pixels[FRAME_PADDING * pitch + FRAME_PADDING * sample->format->BytesPerPixel]
+	};
+	int surf_linesize[] = { pitch };
+	const uint8_t *yuv_data[] = { sqe->yuv_y, sqe->yuv_uv };
+	int yuv_linesize[] = { sqe->yuv_y_pitch, sqe->yuv_uv_pitch };
+
+	sws_scale(
+		ms->yuv_sws,
+		yuv_data,
+		yuv_linesize,
+		0,
+		sqe->yuv_height,
+		surf_data,
+		surf_linesize
+	);
+
+	SDL_Surface *rv = SDL_CreateRGBSurfaceFrom(
+		pixels,
+		w,
+		h,
+		sample->format->BitsPerPixel,
+		pitch,
+		sample->format->Rmask,
+		sample->format->Gmask,
+		sample->format->Bmask,
+		sample->format->Amask
+	);
+
+	if (!rv) {
+#ifndef USE_POSIX_MEMALIGN
+		SDL_free(pixels);
+#else
+		free(pixels);
+#endif
+		return NULL;
+	}
+
+	/* Force SDL to take over management of pixels. */
+	rv->flags &= ~SDL_PREALLOC;
+	return rv;
+}
+
+
 SDL_Surface *media_read_video(MediaState *ms) {
 
 	SDL_Surface *rv = NULL;
 	SurfaceQueueEntry *sqe = NULL;
 
-	if (ms->video_stream == -1) {
-		return NULL;
-	}
-
-	double offset_time = current_time - ms->time_offset;
-
 	SDL_LockMutex(ms->lock);
 
-#ifndef __EMSCRIPTEN__
-	while (!ms->ready) {
-	    SDL_CondWait(ms->cond, ms->lock);
-	}
-#endif
+    if (!ms->ready || ms->video_stream == -1) goto done;
 
-	if (ms->pause_time > 0) {
+	if (ms->pause_time > 0 || ms->seek_req || ms->seeking) {
 	    goto done;
 	}
 
@@ -1248,11 +1881,10 @@ SDL_Surface *media_read_video(MediaState *ms) {
 		goto done;
 	}
 
-	if (ms->video_pts_offset == 0.0) {
-		ms->video_pts_offset = offset_time - ms->surface_queue->pts;
-	}
-
-	if (ms->surface_queue->pts + ms->video_pts_offset <= offset_time + frame_early_delivery) {
+    double now = media_clock_now();
+    if (!ms->video_clock_only && !ms->video_clock_started) ms->video_time_anchor = ms->surface_queue->pts;
+    video_start_clock(ms, now);
+    if (ms->surface_queue->pts <= video_time(ms, now) + frame_early_delivery * ms->video_speed) {
 		sqe = dequeue_surface(&ms->surface_queue);
 		ms->surface_queue_size -= 1;
 
@@ -1263,11 +1895,16 @@ done:
     /* Only signal if we've consumed something. */
 	if (sqe) {
 		ms->needs_decode = 1;
-		ms->video_read_time = offset_time;
 		SDL_CondBroadcast(ms->cond);
 	}
 
 	SDL_UnlockMutex(ms->lock);
+
+	if (sqe && sqe->yuv) {
+		rv = convert_yuv_surface(ms, sqe);
+		free_surface_entry(sqe);
+		return rv;
+	}
 
 	if (sqe) {
 		rv = SDL_CreateRGBSurfaceFrom(
@@ -1284,7 +1921,8 @@ done:
 
 		/* Force SDL to take over management of pixels. */
 		rv->flags &= ~SDL_PREALLOC;
-		av_free(sqe);
+		sqe->pixels = NULL;
+		free_surface_entry(sqe);
 	}
 
 	return rv;
@@ -1294,7 +1932,8 @@ done:
 static int decode_thread(void *arg) {
 	MediaState *ms = (MediaState *) arg;
 
-	int err;
+	int err = AVERROR(ENOMEM);
+	const char *stage = "allocate media context";
 
 	AVFormatContext *ctx = avformat_alloc_context();
 	if (ctx == NULL) {
@@ -1302,18 +1941,24 @@ static int decode_thread(void *arg) {
 	}
 	ms->ctx = ctx;
 
+	stage = "allocate media IO";
 	AVIOContext *io_context = rwops_open(ms->rwops);
 	if (io_context == NULL) {
 		goto finish;
 	}
 	ctx->pb = io_context;
 
+	stage = "open input";
 	err = avformat_open_input(&ctx, ms->filename, NULL, NULL);
 	if (err) {
 		ms->ctx = NULL;
+		/* The format context is freed on failure, but custom IO is ours. */
+		av_freep(&io_context->buffer);
+		avio_context_free(&io_context);
 		goto finish;
 	}
 
+	stage = "find stream info";
 	err = avformat_find_stream_info(ctx, NULL);
 	if (err) {
 		goto finish;
@@ -1341,12 +1986,20 @@ static int decode_thread(void *arg) {
 
 	ms->swr = swr_alloc();
 	if (ms->swr == NULL) {
+		stage = "allocate resampler";
+		err = AVERROR(ENOMEM);
 		goto finish;
 	}
 
+	// Duration remains the full source duration, even for a trimmed stream.
+    if (ctx->duration > 0 && ctx->duration != AV_NOPTS_VALUE &&
+            ctx->duration_estimation_method != AVFMT_DURATION_FROM_BITRATE) {
+        ms->total_duration = (double) ctx->duration / AV_TIME_BASE;
+    }
 	// Compute the number of samples we need to play back.
 	if (ms->audio_duration < 0) {
-		if (ctx->duration_estimation_method != AVFMT_DURATION_FROM_BITRATE) {
+		if (ctx->duration_estimation_method != AVFMT_DURATION_FROM_BITRATE &&
+				ctx->duration >= 0 && ctx->duration <= 3600LL * AV_TIME_BASE) {
 
 			long long duration = ((long long) ctx->duration) * audio_sample_rate;
 			ms->audio_duration = (unsigned int) (duration /  AV_TIME_BASE);
@@ -1371,6 +2024,8 @@ static int decode_thread(void *arg) {
 		av_seek_frame(ctx, -1, (int64_t) (ms->skip * AV_TIME_BASE), AVSEEK_FLAG_BACKWARD);
 	}
 
+    media_publish_stream_info(ms);
+
 	while (!ms->quit) {
 
 		/* ── Runtime seek ──────────────────────────────────
@@ -1378,9 +2033,15 @@ static int decode_thread(void *arg) {
 		 * jump to the requested position without tearing down
 		 * the decode pipeline.
 		 */
-		if (ms->seek_req) {
-			double target = ms->seek_target;
+		SDL_LockMutex(ms->lock);
+		int seek = ms->seek_req;
+		double target = ms->seek_target;
+		if (seek) {
 			ms->seek_req = 0;
+			ms->seeking = 1;
+		}
+		SDL_UnlockMutex(ms->lock);
+		if (seek) {
 
 			/* Seek the demuxer to the target position. */
 			int seek_ret = av_seek_frame(ctx, -1,
@@ -1392,6 +2053,7 @@ static int decode_thread(void *arg) {
 			free_packet_queue(&ms->video_packet_queue);
 
 			/* Drain decoded audio frames. */
+			SDL_LockMutex(ms->lock);
 			while (1) {
 				AVFrame *f = dequeue_frame(&ms->audio_queue);
 				if (!f) break;
@@ -1403,18 +2065,9 @@ static int decode_thread(void *arg) {
 				SurfaceQueueEntry *sqe =
 					dequeue_surface(&ms->surface_queue);
 				if (!sqe) break;
-				if (sqe->pixels) {
-#ifdef USE_POSIX_MEMALIGN
-					free(sqe->pixels);
-#else
-					SDL_free(sqe->pixels);
-#endif
-				}
-				free(sqe);
+				free_surface_entry(sqe);
 			}
-			SDL_LockMutex(ms->lock);
 			ms->surface_queue_size = 0;
-			SDL_UnlockMutex(ms->lock);
 
 			/* Flush decoder-internal buffers so old frames
 			 * aren't returned after the seek. */
@@ -1436,6 +2089,7 @@ static int decode_thread(void *arg) {
 			ms->video_finished = 0;
 			ms->audio_read_samples = 0;
 			ms->audio_queue_samples = 0;
+			ms->skip = target;
 			if (ms->audio_out_frame) {
 				av_frame_free(&ms->audio_out_frame);
 				ms->audio_out_index = 0;
@@ -1447,27 +2101,45 @@ static int decode_thread(void *arg) {
 			 * Subtracting from audio_duration on every
 			 * seek causes it to decay to zero after a
 			 * few drags, which kills playback. */
-			if (ms->total_duration > 0) {
-				int full_samples =
-					(int) (ms->total_duration
-						* audio_sample_rate);
-				ms->audio_duration =
-					full_samples - (int)(target * audio_sample_rate);
-				if (ms->audio_duration <= 0)
-					ms->audio_duration = -1;
-			}
+			double end = ms->audio_end >= 0 ? ms->audio_end : ms->total_duration;
+			ms->audio_duration = end > 0 ? (int) (fmax(0, end - target) * audio_sample_rate) : -1;
+#ifndef __EMSCRIPTEN__
+            ms->tempo_input_samples = 0;
+            ms->tempo_output_samples = 0;
+            ms->tempo_output_limit = -1;
+#endif
+			SDL_UnlockMutex(ms->lock);
+
+            /* These objects are owned exclusively by the decoder. Rebuild
+             * them after seeking, without reopening the (possibly encrypted)
+             * file, so no overlap or resampler history survives the seek. */
+            swr_close(ms->swr);
+#ifndef __EMSCRIPTEN__
+            avfilter_graph_free(&ms->tempo_graph);
+            ms->tempo_source = ms->tempo_sink = NULL;
+            ms->tempo_eof = 0;
+            ms->tempo_resampler_drained = 0;
+            ms->tempo_decode_position = target;
+#endif
+			SDL_LockMutex(ms->lock);
 
 			/* Reset the decode target so the queue refills. */
 			ms->audio_queue_target_samples = 0;
 			ms->needs_decode = 1;
 
-			/* Reset video frame pacing so frames from the new
-			 * position are not discarded as stale.  Without this,
-			 * loop-seek frames would all be dropped because their
-			 * PTS (relative to the old playback) appears to be
-			 * before video_read_time. */
-			ms->video_pts_offset = 0.0;
-			ms->video_read_time = 0.0;
+            /* Seeking resets source position but preserves the rate.
+             * Runtime rate changes never enter this decode/reset path. */
+            ms->video_clock_started = 0;
+            ms->video_clock_ended = 0;
+            ms->video_time_anchor = target;
+            ms->video_clock_anchor = media_clock_now();
+			ms->seeking = 0;
+            if (seek_ret < 0) {
+                av_log(NULL, AV_LOG_ERROR, "[ffmedia] seek failed for %s: %d\n", ms->filename, seek_ret);
+                ms->audio_finished = ms->video_finished = 1;
+                ms->audio_duration = 0;
+            }
+			SDL_UnlockMutex(ms->lock);
 		}
 
 		if (! ms->audio_finished) {
@@ -1496,11 +2168,17 @@ static int decode_thread(void *arg) {
 
 
 finish:
+	if (err < 0) {
+		char message[AV_ERROR_MAX_STRING_SIZE];
+		av_strerror(err, message, sizeof(message));
+		av_log(NULL, AV_LOG_ERROR, "[ffmedia] %s (%s): %s\n", stage, ms->filename, message);
+	}
 	/* Data used by the decoder should be freed here, while data shared with
 	 * the readers should be freed in media_close.
 	 */
 
 	SDL_LockMutex(ms->lock);
+	ms->audio_finished = ms->video_finished = 1;
 
 	/* Ensures that every stream becomes ready. */
 	if (!ms->ready) {
@@ -1508,7 +2186,7 @@ finish:
 		SDL_CondBroadcast(ms->cond);
 	}
 
-	while (!ms->quit) {
+	while (!ms->quit || ms->video_readers) {
 		SDL_CondWait(ms->cond, ms->lock);
 	}
 
@@ -1629,6 +2307,8 @@ static int decode_sync_start(void *arg) {
 
 	// [snip!]
 
+    media_publish_stream_info(ms);
+
 	return 0;
 }
 
@@ -1666,12 +2346,138 @@ void media_read_sync(struct MediaState *ms) {
 }
 
 
+#ifndef __EMSCRIPTEN__
+static int media_read_tempo(MediaState *ms, Uint8 *stream, int len) {
+    int rv = 0;
+    SDL_LockMutex(ms->lock);
+    if (!ms->ready || ms->seek_req || ms->seeking) {
+        SDL_UnlockMutex(ms->lock);
+        return 0;
+    }
+    /* A movie's lifetime follows its video, including silent movies and
+     * soundtracks shorter than the picture. atempo can also produce a few
+     * samples less/more than the requested duration. Bound the output clock
+     * in playback samples, without changing source timestamps or duration. */
+    if (ms->video_context && ms->audio_duration >= 0) {
+        int64_t remaining = (int64_t) ceil(ms->audio_duration / ms->playback_speed) - ms->audio_read_samples;
+        if (remaining < len / BPS) len = (int) fmax(0, remaining) * BPS;
+    }
+    while (len > 0) {
+        if (!ms->audio_out_frame) {
+            ms->audio_out_frame = dequeue_frame(&ms->audio_queue);
+            ms->audio_out_index = 0;
+        }
+        if (!ms->audio_out_frame) break;
+        AVFrame *frame = ms->audio_out_frame;
+        int count = frame->nb_samples * BPS - ms->audio_out_index;
+        if (count > len) count = len;
+        memcpy(stream + rv, frame->data[0] + ms->audio_out_index, count);
+        ms->audio_out_index += count;
+        ms->audio_read_samples += count / BPS;
+        ms->audio_queue_samples -= count / BPS;
+        len -= count;
+        rv += count;
+        if (ms->audio_out_index == frame->nb_samples * BPS) {
+            av_frame_free(&ms->audio_out_frame);
+            ms->audio_out_index = 0;
+        }
+    }
+    if (len > 0 && ms->audio_finished && ms->video_context &&
+            (ms->audio_duration >= 0 || !ms->video_finished || ms->surface_queue_size)) {
+        memset(stream + rv, 0, len);
+        ms->audio_read_samples += len / BPS;
+        rv += len;
+    }
+    /* An empty read is not a refill request. In particular, finished streams
+     * remain open for seeking, but must not wake their decoder on every audio
+     * callback. Seeking explicitly wakes it through media_seek(). */
+    if (rv && !ms->audio_finished) {
+        ms->needs_decode = 1;
+        SDL_CondBroadcast(ms->cond);
+    }
+    SDL_UnlockMutex(ms->lock);
+    return rv;
+}
+#endif
+
+int media_audio_finished(MediaState *ms) {
+    SDL_LockMutex(ms->lock);
+    if (ms->video_clock_only) {
+        int finished = ms->ready && video_clock_finished(ms, media_clock_now());
+        SDL_UnlockMutex(ms->lock);
+        return finished;
+    }
+    int finished = ms->ready && !ms->seek_req && !ms->seeking &&
+        ((ms->playback_speed == 1.0 && ms->audio_duration >= 0 &&
+          ms->audio_read_samples >= ms->audio_duration) ||
+         (ms->audio_finished && ms->audio_queue_samples <= 0 && !ms->audio_out_frame));
+    if (ms->ready && !ms->seek_req && !ms->seeking && ms->video_context && ms->playback_speed != 1.0) {
+        if (ms->audio_duration >= 0) {
+            finished = ms->audio_read_samples >= (int64_t) ceil(ms->audio_duration / ms->playback_speed);
+        } else {
+            finished = finished && ms->video_finished && !ms->surface_queue_size;
+        }
+    }
+    SDL_UnlockMutex(ms->lock);
+    return finished;
+}
+
+double media_audio_position(MediaState *ms) {
+    SDL_LockMutex(ms->lock);
+    if (ms->video_clock_only) {
+        double position = ms->seek_req ? ms->seek_target : video_time(ms, media_clock_now());
+        SDL_UnlockMutex(ms->lock);
+        return position;
+    }
+    double position = ms->skip + ms->audio_read_samples * ms->playback_speed / audio_sample_rate;
+#ifndef __EMSCRIPTEN__
+    double end = ms->skip + (double) ms->tempo_input_samples / audio_sample_rate;
+    if (ms->video_context) {
+        if (ms->audio_duration >= 0) {
+            end = ms->skip + (double) ms->audio_duration / audio_sample_rate;
+            if (position > end) position = end;
+        }
+    } else if (ms->audio_finished) {
+        if (position > end || (!ms->audio_out_frame && !ms->audio_queue.first)) position = end;
+    }
+#endif
+    if (ms->seek_req) position = ms->seek_target;
+    SDL_UnlockMutex(ms->lock);
+    return position;
+}
+
 int media_read_audio(struct MediaState *ms, Uint8 *stream, int len) {
 #ifdef __EMSCRIPTEN__
     media_read_sync(ms);
 #endif
+    SDL_LockMutex(ms->lock);
+    if (ms->want_video && !ms->ready) {
+        SDL_UnlockMutex(ms->lock);
+        return 0;
+    }
+    if (ms->video_clock_only) {
+        if (!ms->ready || ms->seek_req || ms->seeking || ms->pause_time) {
+            SDL_UnlockMutex(ms->lock);
+            return 0;
+        }
+        double now = media_clock_now();
+        video_start_clock(ms, now);
+        if (video_clock_finished(ms, now)) len = 0;
+        memset(stream, 0, len);
+        SDL_UnlockMutex(ms->lock);
+        return len;
+    }
+    SDL_UnlockMutex(ms->lock);
+#ifndef __EMSCRIPTEN__
+    if (ms->playback_speed != 1.0) return media_read_tempo(ms, stream, len);
+#endif
 
 	SDL_LockMutex(ms->lock);
+
+    if (ms->seek_req || ms->seeking) {
+        SDL_UnlockMutex(ms->lock);
+        return 0;
+    }
 
     if(!ms->ready) {
 	    SDL_UnlockMutex(ms->lock);
@@ -1682,7 +2488,7 @@ int media_read_audio(struct MediaState *ms, Uint8 *stream, int len) {
 	int rv = 0;
 
 	if (ms->audio_duration >= 0) {
-		int remaining = (ms->audio_duration - ms->audio_read_samples) * BPS;
+		int remaining = (int) fmax(0, ms->audio_duration - ms->audio_read_samples) * BPS;
 		if (len > remaining) {
 			len = remaining;
 		}
@@ -1742,7 +2548,7 @@ int media_read_audio(struct MediaState *ms, Uint8 *stream, int len) {
 
 	if (ms->audio_duration >= 0) {
 		if ((ms->audio_duration - ms->audio_read_samples) * BPS < len) {
-			len = (ms->audio_duration - ms->audio_read_samples) * BPS;
+			len = (int) fmax(0, ms->audio_duration - ms->audio_read_samples) * BPS;
 		}
 
 		memset(stream, 0, len);
@@ -1754,12 +2560,18 @@ int media_read_audio(struct MediaState *ms, Uint8 *stream, int len) {
 }
 
 int media_is_ready(struct MediaState *ms) {
-	return ms->ready;
+    SDL_LockMutex(ms->lock);
+    int ready = ms->ready;
+    SDL_UnlockMutex(ms->lock);
+    return ready;
 }
 
 
 double media_duration(MediaState *ms) {
-	return ms->total_duration;
+    SDL_LockMutex(ms->lock);
+    double duration = ms->stream_info_ready ? ms->total_duration : 0;
+    SDL_UnlockMutex(ms->lock);
+    return duration;
 }
 
 void media_start(MediaState *ms) {
@@ -1807,6 +2619,12 @@ MediaState *media_open(SDL_RWops *rwops, const char *filename) {
 #endif
 
 	ms->audio_duration = -1;
+	ms->audio_end = -1;
+	ms->playback_speed = 1.0;
+    ms->video_speed = 1.0;
+#ifndef __EMSCRIPTEN__
+    ms->tempo_output_limit = -1;
+#endif
 	ms->frame_drops = 1;
 
 	return ms;
@@ -1824,6 +2642,8 @@ MediaState *media_open(SDL_RWops *rwops, const char *filename) {
  */
 void media_start_end(MediaState *ms, double start, double end) {
 	ms->skip = start;
+	ms->audio_end = end;
+    ms->video_time_anchor = start;
 
 	if (end >= 0) {
 		if (end < start) {
@@ -1834,12 +2654,20 @@ void media_start_end(MediaState *ms, double start, double end) {
 	}
 }
 
+/* Called before media_start; the setting cannot change underneath a stream. */
+void media_set_playback_speed(MediaState *ms, double speed) {
+#ifndef __EMSCRIPTEN__
+    ms->playback_speed = isfinite(speed) && speed >= 0.5 && speed <= 3.0 ? speed : 1.0;
+    ms->video_speed = ms->playback_speed;
+#endif
+}
+
 /**
  * Marks the channel as having video.
  */
 void media_want_video(MediaState *ms, int video) {
 	ms->want_video = 1;
-	ms->frame_drops = (video != 2);
+	ms->frame_drops = (video == 2);
 }
 
 
@@ -1853,8 +2681,17 @@ void media_want_video(MediaState *ms, int video) {
  * Safe to call from any thread.  The seek is processed asynchronously by the
  * decode thread on its next loop iteration.
  */
-void media_seek(struct MediaState *ms, double position) {
+double media_seek(struct MediaState *ms, double position) {
 	SDL_LockMutex(ms->lock);
+
+    if (!isfinite(position)) {
+        position = ms->skip;
+        SDL_UnlockMutex(ms->lock);
+        return position;
+    }
+    position = fmax(0, position);
+    if (ms->total_duration > 0) position = fmin(position, ms->total_duration);
+    if (ms->audio_end >= 0) position = fmin(position, ms->audio_end);
 
 	ms->seek_req = 1;
 	ms->seek_target = position;
@@ -1865,16 +2702,22 @@ void media_seek(struct MediaState *ms, double position) {
 	SDL_CondBroadcast(ms->cond);
 
 	SDL_UnlockMutex(ms->lock);
+    return position;
 }
 
 
 void media_pause(MediaState *ms, int pause) {
+    SDL_LockMutex(ms->lock);
+    double now = media_clock_now();
     if (pause && (ms->pause_time == 0)) {
-        ms->pause_time = current_time;
+        ms->video_time_anchor = video_time(ms, now);
+        ms->video_clock_anchor = now;
+        ms->pause_time = now;
     } else if ((!pause) && (ms->pause_time > 0)) {
-        ms->time_offset += current_time - ms->pause_time;
+        ms->video_clock_anchor = now;
         ms->pause_time = 0;
     }
+    SDL_UnlockMutex(ms->lock);
 }
 
 void media_close(MediaState *ms) {
@@ -1898,7 +2741,8 @@ void media_close(MediaState *ms) {
 }
 
 void media_advance_time(void) {
-	current_time = SPEED * av_gettime() * 1e-6;
+    /* Retained for the backend API. Video clocks now sample monotonic time
+     * at the point of use, including between display updates. */
 }
 
 void media_sample_surfaces(SDL_Surface *rgb, SDL_Surface *rgba) {

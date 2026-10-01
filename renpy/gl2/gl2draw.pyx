@@ -429,6 +429,10 @@ cdef class GL2Draw:
         if renpy.config.gl2_modify_window_flags is not None:
             window_flags = renpy.config.gl2_modify_window_flags(window_flags)
 
+        # Keep the desktop window hidden until a frame has been presented.
+        if renpy.display.interface.first_frame and not renpy.mobile:
+            window_flags |= pygame.WINDOW_HIDDEN
+
         # Select the GL attributes and hints.
         self.select_gl_attributes(gles)
 
@@ -963,18 +967,21 @@ cdef class GL2Draw:
 
     def flip(self):
         """
-        Called to flip the screen after it's drawn.
+        Flips the screen, returning True if the frame was presented.
         """
 
         start = time.time()
 
         renpy.plog(1, "flip")
 
+        presented = True
+
         try:
             pygame.display.flip()
         except pygame.error as e:
             renpy.display.log.write("Flip failed %r", e)
             renpy.game.interface.display_reset = True
+            presented = False
 
         end = time.time()
 
@@ -994,10 +1001,11 @@ cdef class GL2Draw:
                     time.sleep(1.0 / 120.0)
                     renpy.plog(1, "after broken vsync sleep")
 
+        return presented
 
     def draw_screen(self, render_tree, flip=True, screenshot=False):
         """
-        Draws the screen.
+        Draws the screen, returning True if a window frame was presented.
         """
 
         renpy.plog(1, "start draw_screen")
@@ -1008,7 +1016,7 @@ cdef class GL2Draw:
             surf = render_tree
 
         if surf is None:
-            return
+            return False
 
         # Load all the textures and RTTs.
         self.load_all_textures(surf)
@@ -1050,8 +1058,11 @@ cdef class GL2Draw:
         draw_render(surf, w, h, transform)
 
         if flip:
-            self.flip()
+            presented = self.flip()
             self.texture_loader.cleanup()
+            return presented and not screenshot
+
+        return False
 
     def load_all_textures(self, what):
         """

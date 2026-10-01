@@ -415,13 +415,13 @@ init -1500 python in build:
 
     package("gameonly", "null", "all", "Game-Only Update for Mobile", hidden=True)
 
-    package("pc", "zip", "windows linux renpy all", "PC: Windows and Linux")
+    package("pc", "zip", "windows linux linux_arm renpy all", "PC: Windows and Linux")
     package("linux", "tar.bz2", "linux linux_arm renpy all", "Linux")
     package("mac", "app-zip app-dmg", "mac renpy all", "Macintosh")
     package("win", "zip", "windows renpy all", "Windows")
-    package("market", "bare-zip", "windows linux mac renpy all", "Windows, Mac, Linux for Markets")
+    package("market", "bare-zip", "windows linux linux_arm mac renpy all", "Windows, Mac, Linux for Markets")
 
-    package("steam", "zip", "windows linux mac renpy all", hidden=True)
+    package("steam", "zip", "windows linux linux_arm mac renpy all", hidden=True)
     package("android", "directory", "android all", hidden=True, update=False, dlc=True)
     package("ios", "directory", "ios all", hidden=True, update=False, dlc=True)
     package("web", "zip", "web renpy all", hidden=True, update=False, dlc=True)

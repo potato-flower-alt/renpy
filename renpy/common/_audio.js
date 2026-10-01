@@ -268,6 +268,9 @@ let video_start = (c) => {
     }
 
     c.video_el.src = p.url;
+    c.video_el.defaultPlaybackRate = p.playback_speed;
+    c.video_el.playbackRate = p.playback_speed;
+    c.video_el.preservesPitch = true;
     c.video_el.play().then(() => {
         // TODO?
     }).catch((e) => {
@@ -384,7 +387,7 @@ renpyAudio.set_channel_count = (count) => {
 }
 
 
-renpyAudio.queue = (channel, file, name, synchro_start, fadein, tight, start, end, relative_volume, afid) => {
+renpyAudio.queue = (channel, file, name, synchro_start, fadein, tight, start, end, relative_volume, afid, playback_speed = 1.0) => {
 
     const c = get_channel(channel);
 
@@ -400,6 +403,7 @@ renpyAudio.queue = (channel, file, name, synchro_start, fadein, tight, start, en
             start: start,  // TODO?
             end: end,  // TODO?
             relative_volume: relative_volume,
+            playback_speed: playback_speed,
             started: null,
             fadein: fadein,  // TODO?
             fadeout: null,  // TODO?
