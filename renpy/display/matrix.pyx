@@ -105,6 +105,7 @@ cdef class Matrix:
 
     def __init__(Matrix self, l):
 
+        self.invalidate_cache()
         memset(self.m, 0, sizeof(float) * 16)
 
         if l is None:
@@ -145,6 +146,8 @@ cdef class Matrix:
         return rv
 
     def __setstate__(self, state):
+
+        self.invalidate_cache()
 
         memset(self.m, 0, sizeof(float) * 16)
 
@@ -196,6 +199,8 @@ cdef class Matrix:
 
         if self is IDENTITY:
             raise ValueError("Cannot in-place multiply IDENTITY.")
+
+        self.invalidate_cache()
 
         cdef float xdx, xdy, xdz, xdw
         cdef float ydx, ydy, ydz, ydw
@@ -250,6 +255,8 @@ cdef class Matrix:
         because much less allocation and multiplication needs to be done.
         """
 
+        self.invalidate_cache()
+
         cdef float xdx, xdy, xdz, xdw
         cdef float ydx, ydy, ydz, ydw
         cdef float zdx, zdy, zdz, zdw
@@ -270,6 +277,8 @@ cdef class Matrix:
     cdef Matrix inplace_reverse_offset(Matrix self, float xo, float yo):
 
         cdef float xdx, xdy, xdz, xdw
+        self.invalidate_cache()
+
         cdef float ydx, ydy, ydz, ydw
         cdef float zdx, zdy, zdz, zdw
 
@@ -323,12 +332,7 @@ cdef class Matrix:
         Take the values from another matrix.
         """
 
-        cdef float *m = self.m
-        cdef float *om = other.m
-        cdef int i
-
-        for i in range(16):
-            m[i] = om[i]
+        self.ctake(other)
 
         return self
 
@@ -442,6 +446,8 @@ cdef class Matrix:
         Returns the inverse of this matrix.
         """
 
+        self.validate_cache()
+
         if self.inverse_cache is not None:
             return self.inverse_cache
 
@@ -508,6 +514,8 @@ cdef class Matrix:
         Computes the inverse of this matrix in place.
         """
 
+        self.invalidate_cache()
+
         cdef float *m = self.m
         cdef float[16] im
 
@@ -572,6 +580,8 @@ cdef class Matrix:
         Returns the transpose of this matrix.
         """
 
+        self.validate_cache()
+
         if self.transpose_cache is not None:
             return self.transpose_cache
 
@@ -605,6 +615,8 @@ cdef class Matrix:
 
 
         cdef float xdx, xdy, xdz, xdw
+        self.invalidate_cache()
+
         cdef float ydx, ydy, ydz, ydw
         cdef float zdx, zdy, zdz, zdw
         cdef float wdx, wdy, wdz, wdw

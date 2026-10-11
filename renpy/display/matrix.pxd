@@ -1,3 +1,5 @@
+from libc.string cimport memcpy, memcmp
+
 cdef class Matrix:
 
     cdef public float xdx
@@ -31,6 +33,21 @@ cdef class Matrix:
     cdef Matrix inverse_cache
 
     # The transpose of this Matrix.
+    cdef float cache_source[16]
+    cdef bint cache_source_valid
+
+    cdef inline void invalidate_cache(self):
+        self.inverse_cache = None
+        self.transpose_cache = None
+        self.cache_source_valid = False
+
+    cdef inline void validate_cache(self):
+        if not self.cache_source_valid or memcmp(self.m, self.cache_source, 16 * sizeof(float)):
+            self.inverse_cache = None
+            self.transpose_cache = None
+            memcpy(self.cache_source, self.m, 16 * sizeof(float))
+            self.cache_source_valid = True
+
     cdef Matrix transpose_cache
 
     cdef inline void transform4(Matrix self, float *ox, float *oy, float *oz, float *ow, float x, float y, float z, float w):
@@ -58,6 +75,8 @@ cdef class Matrix:
         """
         Take the values from another matrix, and put them into this one.
         """
+
+        self.invalidate_cache()
 
         self.xdx = other.xdx
         self.xdy = other.xdy

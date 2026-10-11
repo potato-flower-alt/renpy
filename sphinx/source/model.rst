@@ -713,6 +713,19 @@ different values for ``pause`` to specify a minimum frame rate, like
 ``pause 1.0/30``.
 
 
+Shader Prediction
+-----------------
+
+Ren'Py predicts combinations from displayables, transforms, transitions,
+Live2D masks, and movie shaders. Games can also register combinations explicitly::
+
+    $ renpy.start_predict_shader("renpy.texture", "my_fancy_shader")
+    $ renpy.pause(predict=True)
+    $ renpy.stop_predict_shader("renpy.texture", "my_fancy_shader")
+
+.. include:: inc/start_predict_shader
+.. include:: inc/stop_predict_shader
+
 Shader Parts
 ------------
 

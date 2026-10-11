@@ -86,6 +86,10 @@ class TextMeshDisplayable(renpy.display.core.Displayable):
         self.mesh = mesh
         self.uniforms = uniforms
 
+    def predict_shaders(self, shaders):
+        renpy.gl2.gl2shadercache.predict_shader(shaders + ("renpy.texture",) + tuple(self.shader))
+        return [(value, ()) for _, value, is_displayable in self.uniforms if is_displayable]
+
     def render(self, width, height, st, at):
         rv = renpy.display.render.Render(self.width, self.height)
 
@@ -2489,6 +2493,17 @@ class Text(renpy.display.displayable.Displayable):
             self.update()
 
         return list(self.displayables)  # type: ignore
+
+    def predict_shaders(self, shaders):
+        children = self.visit()
+        names = [self.style.textshader]
+        names.extend(text.partition("=")[2] for kind, text in self.tokens if kind == TAG and text.startswith("shader="))
+        for name in names:
+            shader = renpy.text.shader.get_textshader(name)
+            if shader is not None:
+                renpy.gl2.gl2shadercache.predict_shader(shaders + ("renpy.texture",) + shader.shader)
+        renpy.gl2.gl2shadercache.predict_shader(shaders + ("renpy.texture",))
+        return [(child, shaders) for child in children]
 
     def _tts(self, raw: bool) -> str:
         if raw:

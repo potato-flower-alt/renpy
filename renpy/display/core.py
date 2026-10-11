@@ -56,11 +56,13 @@ TIMEEVENT = pygame.event.register("TIMEEVENT")
 PERIODIC = pygame.event.register("PERIODIC")
 REDRAW = pygame.event.register("REDRAW")
 EVENTNAME = pygame.event.register("EVENTNAME")
+FILEDIALOG = pygame.event.register("FILEDIALOG")
 
 # All events except for TIMEEVENT and REDRAW
 ALL_EVENTS: set[int] = set(pygame.event.get_standard_events())
 ALL_EVENTS.add(PERIODIC)
 ALL_EVENTS.add(EVENTNAME)
+ALL_EVENTS.add(FILEDIALOG)
 
 enabled_events: set[int] = {
     pygame.QUIT,
@@ -98,6 +100,7 @@ enabled_events: set[int] = {
     PERIODIC,
     REDRAW,
     EVENTNAME,
+    FILEDIALOG,
 }
 
 input_events: set[int] = {
@@ -2258,15 +2261,20 @@ class Interface:
         # We want this to include the GC time, so we don't predict on
         # frames where we GC.
         start = get_time()
+        minimum_end = start + renpy.config.minimum_prediction_time
+
+        renpy.display.predict.predict_registered_shaders()
+        if renpy.gl2.gl2shadercache.has_predicted_shaders():
+            renpy.gl2.gl2shadercache.preload_predicted_shader()
 
         step = 1
 
         while True:
-            if self.event_peek(False) and not self.force_prediction:
+            if get_time() >= minimum_end and self.event_peek(False) and not self.force_prediction:
                 break
 
             if not expensive:
-                if get_time() > (start + 0.0005):
+                if get_time() >= minimum_end:
                     break
 
             # Step 1: Run gc.
@@ -2300,8 +2308,15 @@ class Interface:
                     if not expensive:
                         step += 1
 
-            # Step 4: Preload images (on emscripten)
+            # Step 4: Compile one predicted shader at a time on the GL thread.
             elif step == 4:
+                if renpy.gl2.gl2shadercache.has_predicted_shaders():
+                    renpy.gl2.gl2shadercache.preload_predicted_shader()
+                    continue
+                step += 1
+
+            # Step 5: Preload images (on emscripten)
+            elif step == 5:
                 if renpy.emscripten:
                     if expensive:
                         allow_preload = True
@@ -2322,16 +2337,16 @@ class Interface:
 
                 step += 1
 
-            # Step 5: Autosave.
-            elif step == 5:
+            # Step 6: Autosave.
+            elif step == 6:
                 if not self.did_autosave:
                     renpy.loadsave.autosave()
                     self.did_autosave = True
 
                 step += 1
 
-            # Step 6: Persistent data.
-            elif step == 6:
+            # Step 7: Persistent data.
+            elif step == 7:
                 if not self.did_persistent:
                     if renpy.emscripten:
                         renpy.persistent.update()
@@ -3005,6 +3020,7 @@ class Interface:
                         old_timeout_time = self.timeout_time
 
                 # Process the invoke queue.
+                renpy.nativefiledialog.update()
                 while self.invoke_queue:
                     fn, args, kwargs = self.invoke_queue.pop(0)
                     rv = fn(*args, **kwargs)
@@ -3021,8 +3037,16 @@ class Interface:
                         can_block = True
 
                     self.idle_frame(expensive)
+                elif self.prediction_coroutine or renpy.gl2.gl2shadercache.has_predicted_shaders():
+                    self.idle_frame(False)
 
-                if needs_redraw or (not can_block) or self.mouse_move or renpy.display.video.playing():
+                if (
+                    needs_redraw
+                    or (not can_block)
+                    or self.mouse_move
+                    or renpy.display.video.playing()
+                    or renpy.nativefiledialog.active()
+                ):
                     renpy.plog(1, "pre peek")
                     ev = self.event_poll()
                     renpy.plog(1, "post peek {!r}", ev)
@@ -3037,6 +3061,10 @@ class Interface:
                     if can_block and (not needs_redraw) and (not self.prediction_coroutine) and (not self.mouse_move):
                         pygame.time.wait(1)
 
+                    continue
+
+                if ev.type == FILEDIALOG:
+                    renpy.nativefiledialog.update()
                     continue
 
                 # Add the current keyboard modifiers to all events.
@@ -3083,6 +3111,7 @@ class Interface:
                 # Handle periodic events. This includes updating the mouse timers (and through the loop,
                 # the mouse itself), and the audio system periodic calls.
                 if ev.type == PERIODIC:
+                    renpy.nativefiledialog.update()
                     events = 1 + len(pygame.event.get([PERIODIC]))
                     self.ticks += events
 
@@ -3106,6 +3135,9 @@ class Interface:
                 # Handle quit specially for now.
                 if ev.type == pygame.QUIT:
                     self.quit_event()
+                    continue
+
+                if renpy.nativefiledialog.active() and ev.type in input_events:
                     continue
 
                 # Ignore KEY-events while text is being edited (usually with an IME).

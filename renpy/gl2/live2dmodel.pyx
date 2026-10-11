@@ -21,12 +21,13 @@
 
 from libc.stdint cimport intptr_t
 from libc.stdlib cimport malloc, free
-from libc.string cimport memcpy
+from libc.string cimport memcpy, memcmp
 from libc.stdio cimport printf
 from libc.math cimport floor, ceil
 
 from renpy.gl2.gl2mesh import TEXTURE_LAYOUT
 from renpy.gl2.gl2mesh2 cimport Mesh2
+from renpy.gl2.gl2polygon cimport Point2
 
 from renpy.display.matrix cimport Matrix
 from renpy.display.render cimport Render
@@ -34,6 +35,7 @@ from renpy.display.render cimport Render
 from renpy.uguu.gl cimport GL_ZERO, GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_FUNC_ADD, GL_DST_COLOR, GL_DST_ALPHA
 
 import renpy
+import weakref
 
 cdef extern from "live2dcsm.h" nogil:
     void* load_live2d_object(const char* sofile)
@@ -110,6 +112,8 @@ cdef class AlignedMemory:
 
     def __init__(self, int size, intptr_t alignment, bytes data):
         self.base = malloc(size + alignment)
+        if self.base == NULL:
+            raise MemoryError()
         self.data = <void *> (((<intptr_t> self.base) + alignment) & ~(alignment-1))
         self.size = size
 
@@ -117,6 +121,35 @@ cdef class AlignedMemory:
 
     def __dealloc__(self):
         free(self.base)
+
+
+cdef class Live2DMesh(Mesh2):
+    """An immutable position snapshot sharing a drawable's static topology."""
+
+    cdef Mesh2 topology
+    cdef AlignedMemory positions
+
+    def __init__(self, Mesh2 topology):
+        Mesh2.__init__(self, topology.layout, 0, 0)
+        self.topology = topology
+        self.points = topology.points
+        self.triangles = topology.triangles
+        self.positions = AlignedMemory(self.points * sizeof(Point2), sizeof(float), b"")
+        self.point = <Point2 *> self.positions.data
+        self.point_data = <float *> self.point
+        self.attribute = topology.attribute
+        self.triangle = topology.triangle
+        self.attribute_source = topology
+        self.triangle_source = topology
+        self.point_version = 1
+        self.attribute_version = 1
+        self.triangle_version = 1
+
+
+cdef class Live2DMask(Render):
+    """A weakly cached mask whose lifetime remains owned by the render tree."""
+
+    cdef object __weakref__
 
 class Parameter(object):
     """
@@ -194,6 +227,8 @@ cdef class Live2DModel:
     cdef public dict opacity_groups
 
     cdef list meshes
+    cdef list topologies
+    cdef dict mask_cache
 
     cdef object filename
 
@@ -279,6 +314,10 @@ cdef class Live2DModel:
         self.drawable_indices = csmGetDrawableIndices(self.model)
         self.drawable_multiply_colors = csmGetDrawableMultiplyColors(self.model)
         self.drawable_screen_colors = csmGetDrawableScreenColors(self.model)
+
+        self.meshes = [None] * self.drawable_count
+        self.topologies = [None] * self.drawable_count
+        self.mask_cache = {}
 
         self.parameters = { }
 
@@ -411,6 +450,8 @@ cdef class Live2DModel:
         cdef Render r
         cdef Render m
         cdef Render rv
+        cdef Mesh2 mesh
+        cdef Mesh2 topology
 
         shaders = ("renpy.texture", "live2d.flip_texture", "live2d.colors")
         mask_shaders = ("-renpy.texture", "live2d.mask", "live2d.flip_texture")
@@ -478,16 +519,26 @@ cdef class Live2DModel:
             multiply_tuple = (multiply.X, multiply.Y, multiply.Z, multiply.W)
             screen_tuple = (screen.X, screen.Y, screen.Z, screen.W)
 
-            mesh = Mesh2(TEXTURE_LAYOUT, self.drawable_vertex_counts[i], self.drawable_index_counts[i] // 3)
+            topology = self.topologies[i]
+            if topology is None:
+                topology = Mesh2(TEXTURE_LAYOUT, self.drawable_vertex_counts[i], self.drawable_index_counts[i] // 3)
+                topology.points = self.drawable_vertex_counts[i]
+                topology.triangles = self.drawable_index_counts[i] // 3
+                memcpy(topology.attribute, self.drawable_vertex_uvs[i], sizeof(float) * topology.points * 2)
+                for j in range(topology.triangles * 3):
+                    topology.triangle[j] = self.drawable_indices[i][j]
+                self.topologies[i] = topology
+                topology.attribute_version = 1
+                topology.triangle_version = 1
 
-            mesh.points = self.drawable_vertex_counts[i]
-            memcpy(mesh.point_data, self.drawable_vertex_positions[i], sizeof(float) * mesh.points * 2)
-            memcpy(mesh.attribute, self.drawable_vertex_uvs[i], sizeof(float) * mesh.points * 2)
-
-            mesh.triangles = self.drawable_index_counts[i] // 3
-
-            for j in range(mesh.triangles * 3):
-                mesh.triangle[j] = self.drawable_indices[i][j]
+            mesh = self.meshes[i]
+            # Compare against the last snapshot, including after the drawable
+            # was hidden or the shared Core model evaluated another instance.
+            # This avoids relying on dynamic flags accumulated between updates.
+            if mesh is None or (mesh.points and memcmp(mesh.point_data, self.drawable_vertex_positions[i], sizeof(float) * mesh.points * 2)):
+                mesh = Live2DMesh(topology)
+                memcpy(mesh.point_data, self.drawable_vertex_positions[i], sizeof(float) * mesh.points * 2)
+                self.meshes[i] = mesh
 
             tex = textures[self.drawable_texture_indices[i]]
 
@@ -564,6 +615,8 @@ cdef class Live2DModel:
 
         multi_masks = { }
         cropped_masks = { }
+        next_mask_cache = {}
+        mask_token = (w, h, renpy.display.draw.texture_loader.mask_cache_token())
 
         for i in range(self.drawable_count):
 
@@ -604,6 +657,21 @@ cdef class Live2DModel:
 
             cropped = cropped_masks.get(key)
             if cropped is None:
+                # A mask render is immutable. Reuse it only while its source
+                # geometry, textures, colors and rasterization state match.
+                # Mark-and-sweep may kill a mask retained by this Python cache.
+                signature = tuple(
+                    (self.meshes[j], id(textures[self.drawable_texture_indices[j]]), mask_renders[j].uniforms)
+                    for j in key)
+                cached = self.mask_cache.get(key)
+                if cached is not None and cached[0] == mask_token and cached[1] == signature:
+                    cached_mask = cached[2]()
+                    if cached_mask is not None and not cached_mask.killed:
+                        m = cached_mask
+                        bounds = cached[3]
+                        cropped = cropped_masks[key] = (m, bounds)
+
+            if cropped is None:
                 left, top, right, bottom = w, h, 0, 0
                 for j in key:
                     bounds = mask_bounds[j]
@@ -624,7 +692,16 @@ cdef class Live2DModel:
                 else:
                     m = Render(1, 1)
                     bounds = (0.0, 0.0, 1.0 / w, 1.0 / h)
+                # A weak reference lets mark-and-sweep release masks when a
+                # model is hidden, even though its Core model stays cached.
+                cached_render = Live2DMask(m.width, m.height)
+                cached_render.blit(m, (0, 0))
+                m = cached_render
+                m.add_property("live2d_mask", True)
                 cropped = cropped_masks[key] = (m, bounds)
+
+            if key not in next_mask_cache:
+                next_mask_cache[key] = (mask_token, signature, weakref.ref(cropped[0]), cropped[1])
 
             m, bounds = cropped
 
@@ -647,5 +724,7 @@ cdef class Live2DModel:
 
         for t in renders:
             rv.subpixel_blit(t[1], (0, 0))
+
+        self.mask_cache = next_mask_cache
 
         return rv

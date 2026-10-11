@@ -633,6 +633,8 @@ def load(filename):
 
     renpy.exports.call_in_new_context("_before_load")
 
+    renpy.nativefiledialog.reset("The game is loading a save.")
+
     roots, log = loads(log_data)
 
     log.unfreeze(roots, label="_after_load")

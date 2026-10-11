@@ -33,6 +33,59 @@ from renpy.audio.audio import get_channel, get_serial
 from renpy.audio.audio import register_channel, alias_channel
 
 
+def set_spectrum_enabled(enabled, channel="music", fft_size=4096, update_rate=30.0):
+    """
+    :doc: audio
+
+    Enables or disables live spectrum capture for a registered audio `channel`.
+    Returns True if capture is supported and the audio device is available.
+    Unsupported backends return False without changing playback.
+
+    `fft_size`
+        A power of two from 512 to 8192. Defaults to 4096 output frames.
+
+    `update_rate`
+        A finite number from 1 to 120 Hz. Defaults to 30 Hz. New analysis is
+        limited by output sample counts; querying does not advance playback.
+
+    Invalid channels or parameters raise ValueError, including on unsupported
+    backends. Repeating the same configuration preserves history. Configuration
+    is process-local and does not participate in saves or rollback. Disabling
+    capture releases its buffers and query cache. This is a shared channel
+    switch; games should coordinate overlapping users of the spectrum.
+    """
+    audio = renpy.audio.audio
+    fft_size, update_rate = audio.validate_spectrum_config(fft_size, update_rate)
+    with audio.lock:
+        c = audio.get_spectrum_channel(channel)
+        return c.set_spectrum_enabled(bool(enabled), fft_size, update_rate)
+
+
+def get_spectrum(channel="music"):
+    """
+    :doc: audio
+
+    Returns an immutable :ref:`SpectrumFrame <live-spectrum>` snapshot, or None
+    when capture is disabled, unsupported, or the audio device is unavailable.
+    Does not enable capture or allocate a channel. Enabled idle channels return
+    a stopped snapshot with zero magnitudes, rms, and peak.
+    Repeated concurrent stream changes can also return None for that query;
+    the next query reads a fresh window.
+
+    Analysis measures this channel's stereo contribution after filters, pan,
+    fades and volume, before final mono conversion and clipping. Magnitudes
+    are a linear, Hann-corrected single-sided amplitude spectrum including DC
+    and Nyquist, and are not clamped to [0, 1]. See :ref:`live-spectrum` for
+    timing, states, normalization and lifecycle details.
+    """
+    audio = renpy.audio.audio
+    with audio.lock:
+        c = audio.get_spectrum_channel(channel)
+    # The backend serializes its query workspace. Do not hold the periodic
+    # audio lock across FFT, which releases the GIL.
+    return c.get_spectrum()
+
+
 def play(
     filenames,
     channel="music",

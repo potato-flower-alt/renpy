@@ -63,12 +63,39 @@ def main():
     cython("renpy.encryption")
     cython("renpy.aescrypt", [ "src/aes_rpa.c" ], packages="openssl")
     cython("renpy.tfd", [ "src/tinyfiledialogs/tinyfiledialogs.c" ])
+    if sys.platform in ("win32", "linux", "darwin") and not os.environ.get("RENPY_WEB"):
+        native_sources = ["src/nativefiledialog.cc"]
+        native_packages = "sdl2"
+        native_args = ["-std=c++17"]
+        if sys.platform == "linux":
+            native_packages += " dbus-1 wayland-client"
+        elif sys.platform == "darwin":
+            from setuptools._distutils.unixccompiler import UnixCCompiler
+
+            # setuptools does not recognise Objective-C++ sources by default.
+            # clang selects Objective-C++ from .mm; use C++ for compiler/linker
+            # selection and include .mm in the accepted source suffixes.
+            if ".mm" not in UnixCCompiler.src_extensions:
+                UnixCCompiler.src_extensions = UnixCCompiler.src_extensions + [".mm"]
+            UnixCCompiler.language_map = dict(UnixCCompiler.language_map, **{".mm": "c++"})
+            native_sources.append("src/nativefiledialog_mac.mm")
+            native_args += ["-fblocks"]
+        cython("renpy._nativefiledialog", native_sources, language="c++", packages=native_packages, compile_args=native_args)
+        native_extension = setuplib.extensions[-1]
+        if sys.platform == "win32":
+            native_extension.libraries += ["ole32", "shell32", "uuid", "user32"]
+        elif sys.platform == "darwin":
+            native_extension.extra_link_args += ["-framework", "Cocoa"]
+        else:
+            # Only headers are used from these packages; the runtime probes
+            # their libraries with dlopen so missing backends remain optional.
+            native_extension.libraries = [i for i in native_extension.libraries if i not in ("dbus-1", "wayland-client")]
     cython("renpy.ecsign", [ "src/ec_sign_core.c" ], packages="openssl")
 
     # renpy.audio
     cython(
         "renpy.audio.renpysound",
-        [ "src/renpysound_core.c", "src/ffmedia.c" ],
+        [ "src/renpysound_core.c", "src/ffmedia.c", "src/spectrum.c" ],
         compile_args=[ "-Wno-deprecated-declarations" ] if ("RENPY_FFMPEG_NO_DEPRECATED_DECLARATIONS" in os.environ) else [ ],
         packages="libavfilter libavformat libavcodec libavutil libswresample libswscale sdl2")
 
@@ -101,6 +128,7 @@ def main():
     cython("renpy.gl2.gl2texture")
     cython("renpy.gl2.gl2uniform")
     cython("renpy.gl2.gl2shader")
+    cython("renpy.gl2.gl2statecache")
 
     if cubism:
         cython("renpy.gl2.live2dmodel", [ "src/live2dcsm.c" ],)

@@ -209,6 +209,8 @@ backup_blacklist = {
     "renpy.test.testreporter",
     "renpy.test.testsettings",
     "renpy.tfd",
+    "renpy.nativefiledialog",
+    "renpy._nativefiledialog",
     "renpy.gl2",
     "renpycoverage",
 }
@@ -628,6 +630,8 @@ def reload_all():
     """
 
     import renpy
+
+    renpy.nativefiledialog.reset("The engine is reloading.")
 
     # Quit audio.
     renpy.audio.audio.quit()

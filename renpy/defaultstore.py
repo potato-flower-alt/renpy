@@ -444,6 +444,8 @@ _last_say_kwargs = {}
 _cache_pin_set = set()
 
 # Used to store displayables that should be predicted.
+_predict_shader = renpy.revertable.RevertableSet()
+
 _predict_set = set()
 
 # A map from a screen name to an (args, kwargs) tuple. The arguments and

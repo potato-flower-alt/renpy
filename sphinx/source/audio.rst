@@ -351,6 +351,72 @@ desired. This can be used to delay the start of a sound file. For example::
 Will play silence for half a second, and then an explosion sound.
 
 
+.. _live-spectrum:
+
+Live Spectrum
+-------------
+
+``renpy.music.set_spectrum_enabled(True, channel="music", fft_size=4096,
+update_rate=30.0)`` enables live analysis of the named channel. Disable it with
+``renpy.music.set_spectrum_enabled(False, channel="music")`` when the last
+consumer exits. This is a shared switch, not a reference count. Native backends
+support capture; browser audio returns False and ``get_spectrum`` returns None.
+Invalid parameters raise ValueError even when capture is unsupported.
+
+``renpy.music.get_spectrum(channel="music")`` returns an immutable
+``renpy.audio.audio.SpectrumFrame`` with these attributes:
+
+* ``generation`` marks a discontinuity: enable/configuration or device rebuild,
+  new playback, an actual queue/loop stream switch, seek, or clearing on stop.
+  Reset visual smoothing when it changes. Capture settings are process-local;
+  saves and rollback do not restore them, while restored playback resets history.
+* ``sequence`` increases for each newly published analysis window within a
+  generation. Repeated queries of the same window preserve it and reuse the
+  cached snapshot. A state-only change also preserves the sequence.
+* ``sample_rate`` is the output PCM rate; ``fft_size`` is N.
+* ``sample_time`` is the window's final output frame time in seconds within the
+  current device session, not the query time. It is None before sampling.
+* ``position`` is the source-file position at that window's end, in seconds,
+  including filename start offsets and playback-speed mapping. It is None
+  when unavailable. Decoder starvation does not advance this source position.
+* ``state`` is ``warming`` while fewer than N frames have been collected,
+  ``playing`` during normal output, ``paused`` while frozen, ``starved`` when
+  missing decoder output is being filled with silence, or ``stopped`` after
+  explicit stop or natural completion. Synchro-start waits in ``warming``.
+* ``magnitudes`` is a tuple of N/2+1 finite, linear amplitudes. Bin k represents
+  k times sample_rate/N Hz, including DC and Nyquist.
+* ``rms`` is the root mean square of both channels in the unwindowed PCM window;
+  ``peak`` is the maximum absolute sample in either channel in that window.
+
+Analysis measures this channel's contribution after filters, stereo pan, fades,
+relative volume and mixer volume, before final mono downmix and clipping. Other
+channels, device/system volume, and clipping of the final mix are excluded.
+Values are not clamped to [0, 1]; filters or gain can amplify the contribution.
+Muted playback continues collecting zero contributions; ``stop_on_mute`` clears
+the history. Pausing freezes the published window and sequence; resuming keeps
+the ring. A stopped snapshot contains zeros and no sample time or position.
+Disabled capture returns None and performs no FFT.
+If playback changes repeatedly while a query is computing, that query may
+return None; retrying reads a fresh window rather than publishing stale data.
+
+Each stereo channel is transformed separately with a periodic Hann window.
+The single-sided amplitudes are corrected by its coherent gain (sum of window
+weights), with a factor of two except at DC and Nyquist. The channels' squared
+FFT magnitudes are averaged before taking the square root, so opposite-phase
+stereo does not cancel. For a bin-aligned stereo sine of amplitude A at the
+capture point, its main bin is approximately A and its rms approximately
+A/sqrt(2). This is an amplitude spectrum, not a power spectral density; use
+``rms`` rather than summing bins to measure overall level.
+
+Early windows are left-padded with zeros. Analysis is limited by output sample
+counts at the configured update rate; a new generation or state is reported
+immediately. Capture occurs in the mixer, with FFT performed during queries
+outside the audio lock. Games supply their own log-frequency bands, level
+compression, smoothing, and visual mapping. At 48 kHz, 4096 frames span about
+85.3 ms and resolve about 11.72 Hz per bin. Expect about half a window of visual
+response delay plus the audio device's output buffering.
+
+
 Actions
 -------
 

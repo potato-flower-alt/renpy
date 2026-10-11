@@ -49,6 +49,7 @@ from renpy.gl2.gl2mesh2 cimport Mesh2
 from renpy.gl2.gl2model cimport GL2Model
 
 from renpy.display.matrix cimport Matrix
+from renpy.gl2.gl2statecache cimport GLStateCache
 
 cdef extern from "ffmedia.h":
     ctypedef struct MediaVideoYUV:
@@ -76,10 +77,15 @@ cdef class TextureLoader:
         self.total_texture_size = 0
         self.texture_load_queue = weakref.WeakSet()
         self.draw = draw
+        self.generation = object()
+        self.mask_pool = collections.OrderedDict()
+        self.mask_pool_size = 0
+        self.mask_fbo = 0
+        self.mask_fbo_failed = False
 
     def init(self):
 
-        if self.allocated:
+        if self.allocated or self.mask_fbo:
             self.quit()
 
         self.ftl_program = self.draw.shader_cache.get(("renpy.ftl",))
@@ -88,6 +94,11 @@ cdef class TextureLoader:
         self.free_list = [ ]
         self.total_texture_size = 0
         self.texture_load_queue = weakref.WeakSet()
+
+        self.generation = object()
+        self.mask_pool = collections.OrderedDict()
+        self.mask_pool_size = 0
+        self.mask_fbo_failed = False
 
         self.max_anisotropy = 1.0
         glGetFloatv(MAX_TEXTURE_MAX_ANISOTROPY_EXT, &self.max_anisotropy)
@@ -104,6 +115,16 @@ cdef class TextureLoader:
             glDeleteTextures(1, texnums)
 
         self.allocated = set()
+        self.free_list = []
+        self.mask_pool.clear()
+        self.mask_pool_size = 0
+        self.total_texture_size = 0
+        self.generation = object()
+
+        if self.mask_fbo:
+            self.draw.change_fbo(self.draw.default_fbo)
+            glDeleteFramebuffers(1, &self.mask_fbo)
+            self.mask_fbo = 0
 
     def get_texture_size(self):
         """
@@ -111,6 +132,34 @@ cdef class TextureLoader:
         """
 
         return self.total_texture_size, len(self.allocated)
+
+    def mask_cache_token(self):
+        """Sampling and context state that invalidates cached mask renders."""
+        return (
+            self.generation, self.draw.virt_to_draw.transform(1.0, 1.0),
+            self.max_texture_width, self.max_texture_height, self.max_anisotropy,
+            renpy.config.mipmap, self.draw.auto_mipmap, renpy.config.max_mipmap_level,
+            renpy.config.depth_size,
+        )
+
+    def context_lost(self):
+        """Forget names from a lost context before creating new GL objects."""
+        self.generation = object()
+        self.allocated.clear()
+        self.free_list = []
+        self.mask_pool.clear()
+        self.mask_pool_size = 0
+        self.total_texture_size = 0
+        self.mask_fbo = 0
+        self.mask_fbo_failed = False
+
+    def prepare_context_reset(self):
+        # Release the premultiply program while the old context is still valid.
+        # Clearing ShaderCache alone leaves this strong reference alive.
+        self.ftl_program = None
+
+    def refresh_program(self):
+        self.ftl_program = self.draw.shader_cache.get(("renpy.ftl",))
 
     def load_one_surface(self, surf, bl, bt, br, bb, properties):
         """
@@ -233,7 +282,14 @@ cdef class TextureLoader:
 
         cdef GLuint texnums[1]
 
-        for texture_number in self.free_list:
+        for entry in self.free_list:
+            if isinstance(entry, tuple):
+                texture_number, key, storage_size = entry
+                self.mask_pool[texture_number] = (key, storage_size)
+                self.mask_pool_size += storage_size
+                continue
+
+            texture_number = entry
             texnums[0] = texture_number
             glDeleteTextures(1, texnums)
 
@@ -243,6 +299,16 @@ cdef class TextureLoader:
             self.allocated.discard(texture_number)
 
         self.free_list = [ ]
+
+        # Bound both idle VRAM and the number of names retained as mask sizes
+        # change during animation. Evict the least recently retired storage.
+        while self.mask_pool_size > 32 * 1024 * 1024 or len(self.mask_pool) > 64:
+            texture_number, (key, storage_size) = self.mask_pool.popitem(last=False)
+            texnums[0] = texture_number
+            glDeleteTextures(1, texnums)
+            self.allocated.discard(texture_number)
+            self.mask_pool_size -= storage_size
+            self.total_texture_size -= storage_size
 
 
     def ready_one_texture(self):
@@ -294,6 +360,9 @@ cdef class GLTexture(GL2Model):
 
         # Update the loader.
         self.loader = loader
+        self.generation = loader.generation
+        self.mask_pool_key = None
+        self.mask_storage_size = 0
 
         # Borders.
         self.bl = 0
@@ -447,34 +516,114 @@ cdef class GLTexture(GL2Model):
             0.0, 0.0, 1.0, 1.0,
             )
 
-        cdef GLuint premultiplied
+        cdef GLuint premultiplied = 0
+        cdef GLuint previous_fbo = draw.current_fbo
+        cdef bint direct = (
+            what.properties and what.properties.get("live2d_mask", False)
+            and not renpy.config.depth_size and not loader.mask_fbo_failed)
+        cdef int level, mw, mh
 
-        glGenTextures(1, &premultiplied)
+        if direct:
+            # The storage key includes every allocation/sampler default. A
+            # texture is retired only after its last Render has released it.
+            key = (tw, th, self.has_mipmaps(), renpy.config.max_mipmap_level, loader.max_anisotropy)
+            for number, (pool_key, storage_size) in loader.mask_pool.items():
+                if pool_key == key:
+                    premultiplied = number
+                    break
 
-        # Bind the framebuffer.
-        draw.change_fbo(draw.fbo)
+            if premultiplied:
+                del loader.mask_pool[premultiplied]
+                loader.mask_pool_size -= storage_size
+                self.texture_width = tw
+                self.texture_height = th
+            else:
+                glGenTextures(1, &premultiplied)
+                self.allocate_texture(premultiplied, tw, th, properties)
+
+                # Mask accounting follows physical allocation, including mip
+                # levels, rather than the virtual model dimensions.
+                if self.has_mipmaps():
+                    loader.total_texture_size -= int(self.width * self.height * 4 * 1.34)
+                else:
+                    loader.total_texture_size -= int(self.width * self.height * 4)
+                storage_size = 0
+                mw, mh = tw, th
+                level = 0
+                while True:
+                    storage_size += mw * mh * 4
+                    if (mw == 1 and mh == 1) or not self.has_mipmaps() or level >= renpy.config.max_mipmap_level:
+                        break
+                    mw, mh = max(mw >> 1, 1), max(mh >> 1, 1)
+                    level += 1
+                loader.total_texture_size += storage_size
+
+            self.mask_pool_key = key
+            self.mask_storage_size = storage_size
+            self.number = premultiplied
+            self.loaded = True
+            loader.allocated.add(premultiplied)
+
+            # Sampler uniforms may have changed these states before retirement.
+            self.min_filter = GL_LINEAR_MIPMAP_NEAREST if self.has_mipmaps() and renpy.config.max_mipmap_level else GL_LINEAR
+            self.default_min_filter = self.min_filter
+            glBindTexture(GL_TEXTURE_2D, premultiplied)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, self.mag_filter)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, self.min_filter)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, self.wrap_s)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, self.wrap_t)
+            if loader.max_anisotropy > 1.0:
+                glTexParameterf(GL_TEXTURE_2D, TEXTURE_MAX_ANISOTROPY_EXT, self.anisotropy)
+
+            if not loader.mask_fbo:
+                glGenFramebuffers(1, &loader.mask_fbo)
+            draw.change_fbo(loader.mask_fbo)
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, premultiplied, 0)
+            if glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE:
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0)
+                loader.mask_fbo_failed = True
+                direct = False
+
+        if not direct:
+            if not premultiplied:
+                glGenTextures(1, &premultiplied)
+                self.allocate_texture(premultiplied, tw, th, properties)
+            draw.change_fbo(draw.fbo)
 
         # Project the child from virtual space to the screen space.
         cdef Matrix transform
+        cdef GLint old_scissor[4]
+        cdef bint scissor_enabled
         transform = Matrix.ctexture_projection(cw, ch)
-
-        self.allocate_texture(premultiplied, tw, th, properties)
 
         # Set up the viewport.
         glViewport(0, 0, tw, th)
 
         # Clear the screen.
+        draw.state_cache.reset()
+        scissor_enabled = glIsEnabled(GL_SCISSOR_TEST)
+        glGetIntegerv(GL_SCISSOR_BOX, old_scissor)
         glClearColor(0.0, 0.0, 0.0, 0.0)
+        glEnable(GL_SCISSOR_TEST)
+        glScissor(0, 0, tw, th)
         glClear(GL_COLOR_BUFFER_BIT)
+        glScissor(old_scissor[0], old_scissor[1], old_scissor[2], old_scissor[3])
+        if not scissor_enabled:
+            glDisable(GL_SCISSOR_TEST)
 
         # Set up the default modes.
         glEnable(GL_BLEND)
-        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA)
 
-        renpy.gl2.gl2draw.draw_render(what, tw, th, transform, invert_front_face=True)
+        try:
+            renpy.gl2.gl2draw.draw_render(what, tw, th, transform, draw.state_cache, invert_front_face=True)
 
-        glBindTexture(GL_TEXTURE_2D, premultiplied)
-        glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 0, 0, tw, th, 0)
+            if not direct:
+                glBindTexture(GL_TEXTURE_2D, premultiplied)
+                glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 0, 0, tw, th, 0)
+        finally:
+            if direct:
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0)
+            draw.change_fbo(previous_fbo)
 
         self.mipmap_texture(premultiplied, tw, th, properties)
 
@@ -553,11 +702,13 @@ cdef class GLTexture(GL2Model):
 
         # Set up the blend mode for premultiplication.
         glEnable(GL_BLEND)
-        glBlendFuncSeparate(GL_SRC_ALPHA, GL_ZERO, GL_ONE, GL_ZERO)
+        cdef GLStateCache sc = draw.state_cache
+        sc.reset()
+        sc.set_blend(GL_FUNC_ADD, GL_FUNC_ADD, GL_SRC_ALPHA, GL_ZERO, GL_ONE, GL_ZERO)
 
         # Draw.
         program = self.loader.ftl_program
-        program.draw_ftl(tex, mesh)
+        program.draw_ftl(sc, tex, mesh)
 
         # Create premultiplied.
         self.allocate_texture(premultiplied, self.width, self.height, self.properties)
@@ -568,6 +719,7 @@ cdef class GLTexture(GL2Model):
 
         # Delete tex.
         glDeleteTextures(1, &tex)
+        sc.reset()
 
         # Store the loaded texture.
         self.number = premultiplied
@@ -728,7 +880,21 @@ cdef class GLTexture(GL2Model):
             return
 
         self.properties["mipmap"] = True
-        self.loader.total_texture_size += int(self.width * self.height * 4 * .34)
+        if self.mask_pool_key is not None:
+            tw, th, _, max_level, anisotropy = self.mask_pool_key
+            self.mask_pool_key = (tw, th, True, renpy.config.max_mipmap_level, anisotropy)
+            storage_size = 0
+            level = 0
+            while True:
+                storage_size += tw * th * 4
+                if (tw == 1 and th == 1) or level >= renpy.config.max_mipmap_level:
+                    break
+                tw, th = max(tw >> 1, 1), max(th >> 1, 1)
+                level += 1
+            self.loader.total_texture_size += storage_size - self.mask_storage_size
+            self.mask_storage_size = storage_size
+        else:
+            self.loader.total_texture_size += int(self.width * self.height * 4 * .34)
 
         # This leaves the texture selected.
         self.mipmap_texture(self.number, self.width, self.height, self.properties)
@@ -739,7 +905,14 @@ cdef class GLTexture(GL2Model):
 
     def __del__(self):
         try:
+            if self.generation is not self.loader.generation:
+                return
+
             if self.loaded:
+                if self.mask_pool_key is not None:
+                    self.loader.free_list.append((self.number, self.mask_pool_key, self.mask_storage_size))
+                    return
+
                 self.loader.free_list.append(self.number)
 
                 if self.properties.get("movie_yuv", False):

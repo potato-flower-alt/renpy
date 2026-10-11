@@ -36,6 +36,25 @@ The public commits retain the existing reconstructed history and publication
 cleanup. Private generated security data and commercial SDK binaries were
 excluded from this synchronization.
 
+## 2026-10-11 synchronization
+
+Engine source through `3abc3712dab2` is synchronized with companion build source
+through `539ec99`. This update includes:
+
+- Asynchronous desktop file dialogs and the `renpy.show_file_dialog` API,
+  with Windows COM, Linux portal, and macOS native implementations.
+- Per-channel live stereo spectrum snapshots and unavailable-device handling.
+- Audio underrun sample preservation and corrected Opus seeking.
+- Live2D mask reuse and immutable drawable geometry snapshots.
+- GL2 draw-state caching, reusable mesh buffers, and shader prediction.
+- Matrix cache invalidation and corrected HarfBuzz font setup.
+- Matching API documentation, examples, and regression tests.
+
+The public history, fail-closed security placeholders, and license notices
+remain intact. Use the companion build fork's `BUILDING.md` for current native
+builds; `scripts/nativefiledialog_build.py` is retained as a historical helper.
+Commercial SDKs and generated private security data are excluded.
+
 ## Security-generated data
 
 The public tree deliberately contains no archive key, executable hash, or

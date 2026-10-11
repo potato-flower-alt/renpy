@@ -2093,6 +2093,9 @@ class Alpha(renpy.display.displayable.Displayable):
     def visit(self):
         return [self.child]
 
+    def predict_shaders(self, shaders):
+        return [(self.child, shaders + ("renpy.alpha",))]
+
     def render(self, height, width, st, at):
         if self.anim_timebase:
             t = at
@@ -2313,6 +2316,11 @@ class Flatten(Container):
     def get_placement(self):
         return self.child.get_placement()
 
+    def predict_shaders(self, shaders):
+        renpy.gl2.gl2shadercache.predict_shader(shaders + ("renpy.texture",))
+
+        return [(self.child, ())]
+
 
 class AlphaMask(Container):
     """
@@ -2360,6 +2368,11 @@ class AlphaMask(Container):
 
     def visit(self):
         return [self.mask, self.child]
+
+    def predict_shaders(self, shaders):
+        renpy.gl2.gl2shadercache.predict_shader(shaders + ("renpy.mask",))
+
+        return [(self.mask, ()), (self.child, ())]
 
     def render(self, width, height, st, at):
         cr = renpy.display.render.render(self.child, width, height, st, at)

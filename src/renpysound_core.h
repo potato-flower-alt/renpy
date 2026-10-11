@@ -26,6 +26,13 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 #include <Python.h>
 #include <SDL2/SDL.h>
+#include "spectrum.h"
+
+int RPS_set_spectrum_enabled(int channel, int size);
+int RPS_spectrum_device_available(void);
+int RPS_copy_spectrum(int channel, int size, uint64_t generation, uint64_t count,
+                      int previous_state, double update_rate, float *pcm, RPS_SpectrumSnapshot *snapshot);
+int RPS_validate_spectrum(int channel, uint64_t generation, int state);
 
 void RPS_play(int channel, SDL_RWops *rw, const char *ext, const char *name, int synchro_start, int fadeout, int tight, double start, double end, float relative_volume, PyObject *audio_filter, double playback_speed, double video_playback_speed);
 void RPS_queue(int channel, SDL_RWops *rw, const char *ext, const char *name, int synchro_start, int fadeout, int tight, double start, double end, float relative_volume, PyObject *audio_filter, double playback_speed, double video_playback_speed);

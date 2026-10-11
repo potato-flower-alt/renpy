@@ -1636,6 +1636,19 @@ Showing Images
     When True, Ren'Py will scan images to find the bounding box of the
     non-transparent pixels, and only load those pixels into a texture.
 
+.. var:: config.predict_shaders = True
+
+    Predicts shader combinations from displayables and from
+    :func:`renpy.start_predict_shader`. Programs are compiled on the GL thread
+    before use when prediction time is available. Drawing still compiles any
+    combination that has not been predicted.
+
+.. var:: config.minimum_prediction_time = 0.001
+
+    The minimum time, in seconds, made available to prediction during a frame,
+    including frames with continuous animation or video. Work is performed
+    one step at a time; compiling a single shader can exceed this time.
+
 .. var:: config.predict_statements = 32
 
     This is the number of statements, including the current one, to

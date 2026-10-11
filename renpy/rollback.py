@@ -937,6 +937,7 @@ class RollbackLog(renpy.object.Object):
         raise RollbackException(checkpoints, label, greedy, on_load, abnormal, current_label)
 
     def rollback_core(self, checkpoints, label=None, greedy=True, on_load=False, abnormal=True, current_label=None):
+        renpy.nativefiledialog.reset("The game is rolling back.")
         if not on_load:
             self.complete(False)
 
@@ -1100,6 +1101,8 @@ class RollbackLog(renpy.object.Object):
         Called after an UnfreezeException is raised to actually perform
         the unfreeze.
         """
+
+        renpy.nativefiledialog.reset("The game state is being restored.")
 
         # Fix up old screens.
         renpy.display.screen.before_restart()

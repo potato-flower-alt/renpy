@@ -113,6 +113,39 @@ static int globally_paused = 0;
 /** Should fades be linear rather than logarithmic? */
 static int linear_fades = 0;
 
+/* Only touched with the audio device locked (or by its callback). The ring
+ * has a stable allocation independent of the reallocatable Channel array. */
+struct Spectrum {
+    float *pcm;
+    int size, write, state;
+    uint64_t generation, count;
+    double sample_time, position;
+};
+
+static uint64_t spectrum_generation = 0;
+static uint64_t output_samples = 0;
+
+static void spectrum_reset(struct Spectrum *s, int state) {
+    if (!s) return;
+    s->generation = ++spectrum_generation;
+    s->count = 0;
+    s->write = 0;
+    s->state = state;
+    s->sample_time = s->position = -1;
+}
+
+static void spectrum_stop(struct Spectrum *s) {
+    if (s && s->state != RPS_SPECTRUM_STOPPED) spectrum_reset(s, RPS_SPECTRUM_STOPPED);
+}
+
+static inline void spectrum_push(struct Spectrum *s, float left, float right, uint64_t time) {
+    s->pcm[2 * s->write] = isfinite(left) ? left : 0;
+    s->pcm[2 * s->write + 1] = isfinite(right) ? right : 0;
+    s->write = (s->write + 1) & (s->size - 1);
+    s->count++;
+    s->sample_time = (double) time;
+}
+
 struct Interpolate {
     /* The number of samples that are finished so far. */
     unsigned int done;
@@ -211,6 +244,8 @@ static inline float log_power(float power) {
  * and can play from.
  */
 struct Channel {
+
+    struct Spectrum *spectrum;
 
     /* The currently playing stream, NULL if this sample isn't playing
        anything. */
@@ -353,6 +388,7 @@ static void start_stream(struct Channel* c, int reset_fade) {
 
     c->pos = 0;
     c->playing_at_end = 0;
+    spectrum_reset(c->spectrum, RPS_SPECTRUM_WARMING);
     media_pause(c->playing, c->paused || globally_paused);
     if (!c->queued) {
         c->playing_pad = audio_spec.freq * 2;
@@ -394,7 +430,7 @@ static void post_event(struct Channel *c) {
 #define ZERO_PAN 0.7071067811865476 // cos(PI / 4) and sin(PI / 4)
 
 
-static inline void mix_sample(struct Channel *c, float left, float right, float *left_out, float *right_out) {
+static inline void mix_sample(struct Channel *c, float left, float right, float *left_out, float *right_out, uint64_t time) {
 
     tick_interpolate(&c->fade);
     tick_interpolate(&c->secondary_volume);
@@ -420,6 +456,8 @@ static inline void mix_sample(struct Channel *c, float left, float right, float 
 
     *left_out += left * volume;
     *right_out += right * volume;
+
+    if (c->spectrum) spectrum_push(c->spectrum, left * volume, right * volume, time);
 
     c->last_volume = volume;
 }
@@ -464,7 +502,8 @@ static void callback(void *userdata, Uint8 *stream, int length) {
         /* Keep completed streams available for seeking without polling their
          * decoder queue. A seek clears playing_at_end; a newly queued stream
          * must still be allowed to replace the completed one below. */
-        if (!c->playing || c->paused || (c->playing_at_end && !c->queued)) {
+        if (!c->playing || c->paused || globally_paused || (c->playing_at_end && !c->queued)) {
+            if (!c->playing || (c->playing_at_end && !c->queued)) spectrum_stop(c->spectrum);
             c->last_playing = 0;
             continue;
         }
@@ -487,6 +526,7 @@ static void callback(void *userdata, Uint8 *stream, int length) {
             /* A starved decoder is not an end of stream. Output silence for
              * this callback without advancing the source position. */
             if (!read_length && c->stop_samples != 0 && !media_audio_finished(c->playing)) {
+                if (c->spectrum) c->spectrum->state = RPS_SPECTRUM_STARVED;
                 break;
             }
 
@@ -568,6 +608,7 @@ static void callback(void *userdata, Uint8 *stream, int length) {
                      * backwards and resume playback from the seeked
                      * position. */
                     c->playing_at_end = 1;
+                    spectrum_stop(c->spectrum);
                     break;
                 }
             }
@@ -584,7 +625,7 @@ static void callback(void *userdata, Uint8 *stream, int length) {
             // We have some data in the buffer, so mix it.
             for (int i = 0; (i < read_length) && c->stop_samples; i++) {
 
-                mix_sample(c, float_buffer[i * 2], float_buffer[i * 2 + 1], &mix_buffer[mixed * 2], &mix_buffer[mixed * 2 + 1]);
+                mix_sample(c, float_buffer[i * 2], float_buffer[i * 2 + 1], &mix_buffer[mixed * 2], &mix_buffer[mixed * 2 + 1], output_samples + mixed + 1);
 
                 if (c->stop_samples > 0) {
                     c->stop_samples--;
@@ -594,10 +635,32 @@ static void callback(void *userdata, Uint8 *stream, int length) {
                 mixed += 1;
             }
 
+            if (c->spectrum) {
+                c->spectrum->state = c->spectrum->count < c->spectrum->size ? RPS_SPECTRUM_WARMING : RPS_SPECTRUM_PLAYING;
+                /* Match get_pos's source coordinate. The tempo clock only
+                 * tracks input frames for rate-converted streams. */
+                double video_position = c->video ? media_video_position(c->playing) : -1;
+                if (video_position >= 0) c->spectrum->position = video_position;
+                else if (c->playing_speed != 1.0) c->spectrum->position = media_audio_position(c->playing);
+                else c->spectrum->position = (double) c->pos / audio_spec.freq + c->playing_start_ms / 1000.0;
+                if (!isfinite(c->spectrum->position)) c->spectrum->position = -1;
+            }
+
+        }
+
+        if (c->spectrum && c->spectrum->state == RPS_SPECTRUM_STARVED) {
+            /* The missing contribution is silence, but the source clock stays
+             * at the last decoded frame. Include it in the output window. */
+            while (mixed < length) {
+                spectrum_push(c->spectrum, 0, 0, output_samples + mixed + 1);
+                mixed++;
+            }
         }
 
         c->last_playing = 1;
     }
+
+    output_samples += length;
 
     if (channel_count == 1) {
         for (int i = 0; i < length; i++) {
@@ -683,6 +746,93 @@ static int check_channel(int c) {
     return 0;
 }
 
+/* Configuration and queries run with the GIL held. No Python calls or
+ * allocations occur under LOCK_AUDIO, and queries never allocate channels. */
+int RPS_spectrum_device_available(void) {
+    return initialized && SDL_GetAudioStatus() != SDL_AUDIO_STOPPED;
+}
+
+int RPS_set_spectrum_enabled(int channel, int size) {
+    if (!initialized) return 0;
+    int available = SDL_GetAudioStatus() != SDL_AUDIO_STOPPED;
+    if (size && !available) return 0;
+    if (channel < 0 || (size && (size < 512 || size > 8192 || (size & (size - 1))))) return -1;
+    if (!size && channel >= num_channels) return available;
+    if (check_channel(channel)) return -1;
+    struct Spectrum *s = NULL;
+    if (size) {
+        s = calloc(1, sizeof(*s));
+        if (!s) return -1;
+        s->pcm = malloc(2 * size * sizeof(float));
+        if (!s->pcm) { free(s); return -1; }
+        s->size = size;
+    }
+    LOCK_AUDIO();
+    struct Channel *c = &channels[channel];
+    struct Spectrum *old = c->spectrum;
+    c->spectrum = s;
+    spectrum_reset(s, c->playing && !c->playing_at_end && c->stop_samples ? RPS_SPECTRUM_WARMING : RPS_SPECTRUM_STOPPED);
+    UNLOCK_AUDIO();
+    if (old) { free(old->pcm); free(old); }
+    return available;
+}
+
+static int spectrum_state(struct Channel *c) {
+    int state = c->spectrum->state;
+    if (state != RPS_SPECTRUM_STOPPED && (c->paused || globally_paused)) return RPS_SPECTRUM_PAUSED;
+    return state;
+}
+
+int RPS_copy_spectrum(int channel, int size, uint64_t generation, uint64_t count,
+                      int previous_state, double update_rate, float *pcm, RPS_SpectrumSnapshot *snapshot) {
+    if (!initialized) return 0;
+    int copied = 1;
+    LOCK_AUDIO();
+    if (channel < 0 || channel >= num_channels || !channels[channel].spectrum || channels[channel].spectrum->size != size) {
+        UNLOCK_AUDIO();
+        return 0;
+    }
+    struct Channel *c = &channels[channel];
+    struct Spectrum *s = c->spectrum;
+    if (SDL_GetAudioStatus() == SDL_AUDIO_STOPPED) {
+        spectrum_stop(s);
+        UNLOCK_AUDIO();
+        return 0;
+    }
+    snapshot->generation = s->generation;
+    snapshot->count = s->count;
+    snapshot->sample_rate = audio_spec.freq;
+    snapshot->fft_size = size;
+    snapshot->state = spectrum_state(c);
+    snapshot->sample_time = s->sample_time < 0 ? -1 : s->sample_time / audio_spec.freq;
+    snapshot->position = s->position;
+    /* Freeze a published window while paused. If no window was queried yet,
+     * the frozen PCM is still available to compute the first snapshot. */
+    if (s->generation != generation ||
+        (s->count != count && (snapshot->state != RPS_SPECTRUM_PAUSED) &&
+         (!count || snapshot->state != previous_state ||
+          (double) (s->count - count) >= audio_spec.freq / update_rate))) {
+        int filled = s->count < size ? (int) s->count : size;
+        int start = (s->write - filled) & (size - 1);
+        int first = min(filled, size - start);
+        memset(pcm, 0, (size - filled) * 2 * sizeof(float));
+        memcpy(pcm + 2 * (size - filled), s->pcm + 2 * start, first * 2 * sizeof(float));
+        memcpy(pcm + 2 * (size - filled + first), s->pcm, (filled - first) * 2 * sizeof(float));
+        copied = 2;
+    }
+    UNLOCK_AUDIO();
+    return copied;
+}
+
+int RPS_validate_spectrum(int channel, uint64_t generation, int state) {
+    if (!initialized || SDL_GetAudioStatus() == SDL_AUDIO_STOPPED) return 0;
+    LOCK_AUDIO();
+    int valid = channel >= 0 && channel < num_channels && channels[channel].spectrum &&
+        channels[channel].spectrum->generation == generation && spectrum_state(&channels[channel]) == state;
+    UNLOCK_AUDIO();
+    return valid;
+}
+
 
 /*
  * Loads the provided stream. Returns the stream on success, NULL on
@@ -752,6 +902,8 @@ void RPS_play(int channel, SDL_RWops *rw, const char *ext, const char *name, int
             c->queued_audio_filter = NULL;
         }
     }
+
+    spectrum_stop(c->spectrum);
 
     /* Allocate playing sample. */
 
@@ -886,6 +1038,7 @@ void RPS_seek(int channel, double position) {
          * Without this, RPS_get_pos() would keep reporting the
          * pre-seek position because c->pos was never updated. */
         position = media_seek(c->playing, position);
+        spectrum_reset(c->spectrum, RPS_SPECTRUM_WARMING);
         c->pos = 0;
         c->playing_start_ms = (int) (position * 1000);
     }
@@ -934,6 +1087,8 @@ void RPS_stop(int channel) {
     c = &channels[channel];
 
     LOCK_AUDIO();
+
+    spectrum_stop(c->spectrum);
 
     if (c->playing) {
         post_event(c);
@@ -1108,6 +1263,7 @@ void RPS_fadeout(int channel, int ms) {
     }
 
     if (ms == 0 || c->playing_synchro_start) {
+        spectrum_stop(c->spectrum);
         c->stop_samples = 0;
         c->playing_tight = 0;
         c->playing_synchro_start = 0;
@@ -1597,6 +1753,7 @@ void RPS_init(int freq, int stereo, int samples, int status, int equal_mono, int
 
     initialized = 1;
     globally_paused = 0;
+    output_samples = 0;
 
     error(SUCCESS);
 }
@@ -1618,6 +1775,12 @@ void RPS_quit() {
     }
 
     SDL_CloseAudio();
+    for (i = 0; i < num_channels; i++) {
+        struct Spectrum *s = channels[i].spectrum;
+        if (s) { free(s->pcm); free(s); }
+    }
+    free(channels);
+    channels = NULL;
     SDL_QuitSubSystem(SDL_INIT_AUDIO);
 
     SDL_DestroyMutex(name_mutex);

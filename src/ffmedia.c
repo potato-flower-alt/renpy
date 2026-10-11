@@ -922,6 +922,29 @@ fail:
 }
 
 
+static int seek_media(MediaState *ms, double position) {
+	double seek_position = position;
+
+	if (ms->audio_stream >= 0) {
+		AVCodecParameters *parameters = ms->ctx->streams[ms->audio_stream]->codecpar;
+		if (parameters->codec_id == AV_CODEC_ID_OPUS) {
+			/* The 80 ms minimum does not fully converge on noisy audio. */
+			double preroll = 0.25;
+			if (parameters->sample_rate > 0) {
+				preroll = fmax(preroll, 1.0 * parameters->seek_preroll / parameters->sample_rate);
+			}
+			seek_position = fmax(0.0, position - preroll);
+		}
+	}
+
+	int ret = av_seek_frame(ms->ctx, -1, (int64_t) (seek_position * AV_TIME_BASE), AVSEEK_FLAG_BACKWARD);
+	if (ret < 0) {
+		av_log(ms->ctx, AV_LOG_ERROR, "Could not seek media to %.6f seconds (%d).\n", position, ret);
+	}
+	return ret;
+}
+
+
 /* Audio decoding *************************************************************/
 
 #ifndef __EMSCRIPTEN__
@@ -2021,7 +2044,7 @@ static int decode_thread(void *arg) {
 	}
 
 	if (ms->skip != 0.0) {
-		av_seek_frame(ctx, -1, (int64_t) (ms->skip * AV_TIME_BASE), AVSEEK_FLAG_BACKWARD);
+		seek_media(ms, ms->skip);
 	}
 
     media_publish_stream_info(ms);
@@ -2044,9 +2067,7 @@ static int decode_thread(void *arg) {
 		if (seek) {
 
 			/* Seek the demuxer to the target position. */
-			int seek_ret = av_seek_frame(ctx, -1,
-				(int64_t) (target * AV_TIME_BASE),
-				AVSEEK_FLAG_BACKWARD);
+			int seek_ret = seek_media(ms, target);
 
 			/* Drain stale packets from both queues. */
 			free_packet_queue(&ms->audio_packet_queue);
@@ -2302,7 +2323,7 @@ static int decode_sync_start(void *arg) {
 	}
 
 	if (ms->skip != 0.0) {
-		av_seek_frame(ctx, -1, (int64_t) (ms->skip * AV_TIME_BASE), AVSEEK_FLAG_BACKWARD);
+		seek_media(ms, ms->skip);
 	}
 
 	// [snip!]
@@ -2481,8 +2502,7 @@ int media_read_audio(struct MediaState *ms, Uint8 *stream, int len) {
 
     if(!ms->ready) {
 	    SDL_UnlockMutex(ms->lock);
-	    memset(stream, 0, len);
-	    return len;
+	    return 0;
 	}
 
 	int rv = 0;
@@ -2538,23 +2558,25 @@ int media_read_audio(struct MediaState *ms, Uint8 *stream, int len) {
 		}
 	}
 
-	/* Only signal if we've consumed something. */
-	if (rv) {
+	/* Only signal if we've consumed something before decoder EOF. */
+	if (rv && !ms->audio_finished) {
 		ms->needs_decode = 1;
 		SDL_CondBroadcast(ms->cond);
 	}
 
-	SDL_UnlockMutex(ms->lock);
-
-	if (ms->audio_duration >= 0) {
-		if ((ms->audio_duration - ms->audio_read_samples) * BPS < len) {
-			len = (int) fmax(0, ms->audio_duration - ms->audio_read_samples) * BPS;
-		}
-
+	/* An underrun is not silence in the source. Preserve the source clock
+	 * until the decoder supplies real samples. After decoder EOF, preserve
+	 * padding to a known/requested end and a movie's video clock. Keep this
+	 * under the stream lock, shared with the decoder and seek operations. */
+	if (len > 0 && ms->audio_finished &&
+			(ms->audio_duration >= 0 || (ms->video_context &&
+			 (!ms->video_finished || ms->surface_queue_size)))) {
 		memset(stream, 0, len);
 		ms->audio_read_samples += len / BPS;
 		rv += len;
 	}
+
+	SDL_UnlockMutex(ms->lock);
 
 	return rv;
 }

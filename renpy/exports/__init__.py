@@ -36,6 +36,7 @@ import os
 
 import renpy
 import renpy.pygame as pygame_sdl2  # As a public export.
+from renpy.nativefiledialog import show_file_dialog as show_file_dialog
 
 try:
     import emscripten
@@ -517,8 +518,10 @@ from renpy.exports.predictexports import (
     expand_predict,
     predicting,
     start_predict_screen,
+    start_predict_shader as start_predict_shader,
     start_predict,
     stop_predict_screen,
+    stop_predict_shader as stop_predict_shader,
     stop_predict,
 )
 

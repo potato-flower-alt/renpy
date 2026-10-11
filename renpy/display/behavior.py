@@ -604,6 +604,9 @@ class PauseBehavior(renpy.display.layout.Null):
 
     def event(self, ev, x, y, st):
         if ev.type == renpy.display.core.TIMEEVENT:
+            if renpy.nativefiledialog.active():
+                renpy.game.interface.timeout(0.05)
+                return
             if ev.modal and self.modal:
                 renpy.game.interface.timeout(max(self.delay - st, 0))
                 return
@@ -729,6 +732,8 @@ class SayBehavior(renpy.display.layout.Null):
                 self.afm_length += max(text.end - text.start, 1)
 
     def event(self, ev, x, y, st):
+        if renpy.nativefiledialog.active():
+            return None
         if self.afm_length and renpy.game.preferences.afm_time and renpy.game.preferences.afm_enable:
             afm_delay = (
                 1.0 * (renpy.config.afm_bonus + self.afm_length) / renpy.config.afm_characters

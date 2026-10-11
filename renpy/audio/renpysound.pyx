@@ -52,12 +52,37 @@ from __future__ import print_function
 
 import renpy
 
-from libc.stdint cimport uintptr_t
+from libc.stdint cimport uintptr_t, uint64_t
+from libc.stdlib cimport malloc, free
+
+import threading
 
 from renpy.pygame.rwobject cimport RWopsFromPython
 from sdl2 cimport SDL_RWops
 
 cdef extern from "renpysound_core.h":
+
+    ctypedef struct RPS_SpectrumSnapshot:
+        uint64_t generation
+        uint64_t count
+        int sample_rate
+        int fft_size
+        int state
+        double sample_time
+        double position
+
+    ctypedef struct RPS_SpectrumFFT:
+        pass
+
+    RPS_SpectrumFFT *RPS_spectrum_fft_new(int size)
+    void RPS_spectrum_fft_free(RPS_SpectrumFFT *fft)
+    void RPS_spectrum_fft_analyze(RPS_SpectrumFFT *fft, const float *pcm,
+                                 double *magnitudes, double *rms, double *peak) noexcept nogil
+    int RPS_set_spectrum_enabled(int channel, int size)
+    int RPS_spectrum_device_available()
+    int RPS_copy_spectrum(int channel, int size, uint64_t generation, uint64_t count,
+                         int previous_state, double update_rate, float *pcm, RPS_SpectrumSnapshot *snapshot)
+    int RPS_validate_spectrum(int channel, uint64_t generation, int state)
 
     void RPS_play(int channel, SDL_RWops *rw, char *ext, char* name, int synchro_start, int fadein, int tight, double start, double end, float volume, object audio_filter, double playback_speed, double video_playback_speed)
     void RPS_queue(int channel, SDL_RWops *rw, char *ext, char *name, int synchro_start, int fadein, int tight, double start, double end, float volume, object audio_filter, double playback_speed, double video_playback_speed)
@@ -538,6 +563,7 @@ def quit(): # @ReservedAssignment
     """
 
     RPS_quit()
+    _spectrum_analyzers.clear()
 
 
 def periodic():
@@ -617,5 +643,113 @@ def sample_surfaces(rgb, rgba):
 
 # Is this the webaudio module?
 is_webaudio = False
+
+
+_spectrum_analyzers = {}
+_spectrum_states = ("warming", "playing", "paused", "starved", "stopped")
+
+
+cdef class _SpectrumAnalyzer:
+    cdef int size
+    cdef double rate
+    cdef float *pcm
+    cdef double *magnitudes
+    cdef RPS_SpectrumFFT *fft
+    cdef uint64_t generation, count, sequence
+    cdef object cache, lock
+
+    def __cinit__(self, int size, double rate):
+        self.size = size
+        self.rate = rate
+        self.pcm = <float *> malloc(2 * size * sizeof(float))
+        self.magnitudes = <double *> malloc((size // 2 + 1) * sizeof(double))
+        self.fft = RPS_spectrum_fft_new(size)
+        if self.pcm == NULL or self.magnitudes == NULL or self.fft == NULL:
+            raise MemoryError("Unable to allocate spectrum analysis buffers.")
+        self.lock = threading.Lock()
+
+    def __dealloc__(self):
+        free(self.pcm)
+        free(self.magnitudes)
+        RPS_spectrum_fft_free(self.fft)
+
+    def read(self, int channel):
+        cdef RPS_SpectrumSnapshot snapshot
+        cdef int copied, previous_state
+        cdef double rms, peak
+        cdef uint64_t sequence
+        # The query mutex protects only this workspace. The callback never
+        # takes it. Keeping self alive also makes disable/quit safe during FFT.
+        with self.lock:
+            for attempt in range(3):
+                previous_state = _spectrum_states.index(self.cache.state) if self.cache is not None else -1
+                copied = RPS_copy_spectrum(channel, self.size, self.generation, self.count,
+                                           previous_state, self.rate, self.pcm, &snapshot)
+                if not copied:
+                    return None
+                state = _spectrum_states[snapshot.state]
+                if copied == 1:
+                    if self.cache.state != state:
+                        self.cache = self.cache._replace(state=state)
+                    return self.cache
+                with nogil:
+                    RPS_spectrum_fft_analyze(self.fft, self.pcm, self.magnitudes, &rms, &peak)
+                # A seek, stream switch, close, or device rebuild while the GIL
+                # was released invalidates the copied window. Never publish it.
+                if not RPS_validate_spectrum(channel, snapshot.generation, snapshot.state):
+                    continue
+                sequence = self.sequence + 1 if self.generation == snapshot.generation else 1
+                from renpy.audio.audio import SpectrumFrame
+                frame = SpectrumFrame(
+                    snapshot.generation, sequence, snapshot.sample_rate, self.size,
+                    snapshot.sample_time if snapshot.sample_time >= 0 else None,
+                    snapshot.position if snapshot.position >= 0 else None, state,
+                    tuple(self.magnitudes[i] for i in range(self.size // 2 + 1)), rms, peak)
+                self.generation = snapshot.generation
+                self.count = snapshot.count
+                self.sequence = sequence
+                self.cache = frame
+                return frame
+            return None
+
+
+def set_spectrum_enabled(int channel, enabled, fft_size=4096, update_rate=30.0):
+    from renpy.audio.audio import validate_spectrum_config
+    fft_size, update_rate = validate_spectrum_config(fft_size, update_rate)
+    cdef _SpectrumAnalyzer old = _spectrum_analyzers.get(channel)
+    cdef _SpectrumAnalyzer analyzer
+    cdef int supported
+    if channel < 0:
+        raise ValueError("Audio channel number must be nonnegative.")
+    if not enabled:
+        supported = RPS_set_spectrum_enabled(channel, 0)
+        _spectrum_analyzers.pop(channel, None)
+    elif old is not None and old.size == fft_size and old.rate == update_rate:
+        # Same configuration must still report device loss, without resetting
+        # its ring or allocating another plan.
+        return bool(RPS_spectrum_device_available())
+    else:
+        analyzer = _SpectrumAnalyzer(fft_size, update_rate)
+        # Allocate before swapping the native ring. Failed allocation leaves
+        # the old configuration usable. Rate changes also reset continuity.
+        supported = RPS_set_spectrum_enabled(channel, fft_size)
+        if supported > 0:
+            _spectrum_analyzers[channel] = analyzer
+    if supported < 0:
+        raise MemoryError("Unable to configure spectrum capture.")
+    return bool(supported)
+
+
+def get_spectrum(int channel):
+    if channel < 0:
+        raise ValueError("Audio channel number must be nonnegative.")
+    analyzer = _spectrum_analyzers.get(channel)
+    if analyzer is None:
+        return None
+    return analyzer.read(channel)
+
+
+def _spectrum_device_available():
+    return bool(RPS_spectrum_device_available())
 
 # When changing this API, change webaudio.py, too!

@@ -16,6 +16,16 @@ from renpy.preferences import Preferences
 
 
 class VideoSpeedTests(unittest.TestCase):
+    def test_movie_shader_hook_is_bound_and_loadability_remains_static(self):
+        movie = object.__new__(video.Movie)
+        movie.mask = "mask.webm"
+        movie.side_mask = False
+        with patch.object(renpy.gl2.gl2shadercache, "predict_shader") as predict:
+            self.assertEqual(movie.predict_shaders(("custom",)), [])
+        self.assertEqual(predict.call_count, 3)
+        predict.assert_any_call(("custom", "-renpy.texture", "renpy.movie_yuv"))
+        self.assertIsInstance(video.Movie.__dict__["any_loadable"], staticmethod)
+
     def setUp(self):
         self.context = SimpleNamespace(music={}, init_phase=False)
         for p in (

@@ -57,6 +57,38 @@ def displayable(d):
     if d not in predicted:
         predicted.add(d)
         d.visit_all(lambda i: i.predict_one())
+        predict_displayable_shaders(d)
+
+
+def predict_displayable_shaders(d):
+    if not renpy.config.predict_shaders:
+        return
+
+    stack = [(d, ())]
+    seen = set()
+
+    while stack:
+        d, shaders = stack.pop()
+        key = (id(d), shaders)
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        try:
+            children = d.predict_shaders(shaders)
+        except Exception:
+            if renpy.config.debug_prediction:
+                raise
+            continue
+        stack.extend(reversed(children))
+
+
+def predict_registered_shaders():
+    if not renpy.config.predict_shaders:
+        return
+    for shaders in renpy.store._predict_shader:
+        renpy.gl2.gl2shadercache.predict_shader(shaders)
 
 
 def screen(_screen_name, *args, **kwargs):
@@ -206,6 +238,18 @@ def prediction_coroutine(root_widget):
         predicting = True
 
         renpy.display.screen.predict_screen(name, *args, **kwargs)
+
+        predicting = False
+
+    predict_registered_shaders()
+
+    # Pre-build shader combinations exposed by prediction.
+    while renpy.gl2.gl2shadercache.has_predicted_shaders():
+        yield True
+
+        predicting = True
+
+        renpy.gl2.gl2shadercache.preload_predicted_shader()
 
         predicting = False
 

@@ -130,6 +130,19 @@ def proxy_call_both(func):
 
 
 @proxy_with_channel
+def set_spectrum_enabled(channel, enabled, fft_size=4096, update_rate=30.0):
+    from renpy.audio.audio import validate_spectrum_config
+
+    validate_spectrum_config(fft_size, update_rate)
+    return False
+
+
+@proxy_with_channel
+def get_spectrum(channel):
+    return None
+
+
+@proxy_with_channel
 def play(
     channel,
     file,

@@ -11,11 +11,13 @@ import math
 import os
 from pathlib import Path
 import re
+import random
 import struct
 import subprocess
 import tempfile
 import unittest
 import wave
+import shutil
 
 
 @unittest.skipUnless(os.environ.get("RENPY_TEMPO_DRIVER"), "native decoder driver not built")
@@ -118,12 +120,49 @@ class AudioTempoTests(unittest.TestCase):
                     self.assert_duration(samples, 1.75 - start, speed)
                     self.assertAlmostEqual(position, 1.75, delta=0.025)
 
+    @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg fixture encoder unavailable")
+    def test_opus_initial_runtime_and_loop_entry_seek(self):
+        # Deterministic broadband input exposes Opus state convergence errors
+        # that a steady sine can hide. Compare seeks against continuous decode.
+        for rate in (44100, 48000):
+            source = Path(self.temp.name) / "noise.wav"
+            rng = random.Random(71)
+            noise = array.array("h", (rng.randrange(-14000, 14000) for _ in range(rate * 3 * 2)))
+            with wave.open(str(source), "wb") as output:
+                output.setparams((2, 2, rate, 0, "NONE", "not compressed"))
+                output.writeframes(noise.tobytes())
+            opus = Path(self.temp.name) / "noise.opus"
+            subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(source), "-c:a", "libopus", "-b:a", "128k", str(opus)], check=True)
+            continuous, _ = self.decode(opus, 1)
+            for start in (0.05, 0.5, 1.25, 2.0):
+                with self.subTest(rate=rate, start=start):
+                    pcm, [(count, position, duration)] = self.decode(opus, 1, start, 2.5)
+                    offset = round(start * 44100) * 2
+                    reference = continuous[offset:offset + len(pcm)]
+                    self.assertEqual(len(reference), len(pcm))
+                    error = sum(abs(a - b) for a, b in zip(pcm, reference)) / len(pcm)
+                    self.assertLess(error, 8, "seek differs from continuous Opus decode")
+                    self.assertAlmostEqual(count / 44100, 2.5 - start, delta=0.025)
+                    self.assertAlmostEqual(position, 2.5, delta=0.025)
+                    self.assertAlmostEqual(duration, 3, delta=0.025)
+            for speed in (0.5, 1.0, 1.5, 3.0):
+                _, passes = self.decode(opus, speed, 0.5, 2.5, (2.0, 0.5, 0.5, 2.5))
+                for (count, position, _), start in zip(passes, (0.5, 2.0, 0.5, 0.5, 2.5)):
+                    self.assert_duration(count, 2.5 - start, speed)
+                    self.assertAlmostEqual(position, 2.5, delta=0.025)
+
     def assert_duration(self, samples, source_duration, speed):
         self.assertAlmostEqual(samples / 44100, source_duration / speed, delta=0.1)
 
     def test_empty_reads_leave_decoder_idle(self):
         result = subprocess.run(
             [os.environ["RENPY_TEMPO_DRIVER"], "--idle"], capture_output=True, timeout=5
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
+
+    def test_unity_and_tempo_underruns_preserve_source_audio(self):
+        result = subprocess.run(
+            [os.environ["RENPY_TEMPO_DRIVER"], "--underrun"], capture_output=True, timeout=5
         )
         self.assertEqual(result.returncode, 0, result.stderr.decode(errors="replace"))
 

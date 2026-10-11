@@ -65,6 +65,7 @@ def run(restart):
     will cause this to change.
     """
 
+    renpy.nativefiledialog.reset("The game is restarting.")
     reset_clock()
 
     # Reset the store to a clean version of itself.
@@ -626,6 +627,8 @@ def main():
 
     finally:
         gc.set_debug(0)
+
+        renpy.nativefiledialog.shutdown()
 
         for i in renpy.config.quit_callbacks:
             i()

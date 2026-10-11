@@ -635,6 +635,20 @@ class Live2D(renpy.display.displayable.Displayable):
 
     default_fade = 1.0
 
+    def predict_shaders(self, shaders):
+        if not renpy.has_live2d():
+            return []
+        init()
+        from renpy.gl2.gl2shadercache import predict_shader
+        for mask in (None, "live2d.mask", "live2d.inverted_mask"):
+            parts = shaders + ("renpy.texture", "live2d.colors", "live2d.flip_texture")
+            if mask:
+                parts += ("-renpy.texture", mask)
+            predict_shader(parts)
+            predict_shader(parts + ("renpy.alpha",))
+        predict_shader(("renpy.texture", "live2d.colors", "live2d.flip_texture"))
+        return []
+
     def create_common(self):
         key = (self.filename, self.default_fade)
         rv = common_cache.get(key, None)

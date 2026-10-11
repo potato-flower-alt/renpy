@@ -33,6 +33,9 @@ import re
 import threading
 import sys
 import io
+import math
+import operator
+from typing import NamedTuple
 
 import renpy
 
@@ -48,6 +51,49 @@ serial = 0
 
 # The number of channels passed to the last call of set_channel_count
 old_channel_count = 0
+
+
+class SpectrumFrame(NamedTuple):
+    """An immutable snapshot of one channel's contribution to the output mix."""
+
+    generation: int
+    sequence: int
+    sample_rate: int
+    fft_size: int
+    sample_time: float | None
+    position: float | None
+    state: str
+    magnitudes: tuple[float, ...]
+    rms: float
+    peak: float
+
+
+def validate_spectrum_config(fft_size, update_rate):
+    if isinstance(fft_size, bool):
+        raise ValueError("fft_size must be a power of two from 512 to 8192.")
+    try:
+        fft_size = operator.index(fft_size)
+    except TypeError:
+        raise ValueError("fft_size must be a power of two from 512 to 8192.") from None
+    if fft_size < 512 or fft_size > 8192 or fft_size & (fft_size - 1):
+        raise ValueError("fft_size must be a power of two from 512 to 8192.")
+    if isinstance(update_rate, (str, bytes, bool)):
+        raise ValueError("update_rate must be a finite number from 1 to 120 Hz.")
+    try:
+        update_rate = float(update_rate)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("update_rate must be a finite number from 1 to 120 Hz.") from None
+    if not math.isfinite(update_rate) or not 1 <= update_rate <= 120:
+        raise ValueError("update_rate must be a finite number from 1 to 120 Hz.")
+    return fft_size, update_rate
+
+
+def get_spectrum_channel(name):
+    # Unlike get_channel, inspecting a spectrum must not create an automatic
+    # channel or pick a different member of an automatic channel group.
+    if not isinstance(name, str) or name not in channels:
+        raise ValueError("Audio channel %r is unknown; spectrum requires a registered channel." % (name,))
+    return channels[name]
 
 
 def get_serial():
@@ -263,6 +309,9 @@ class Channel(object):
         # number when there's an operation on the channel other than
         # setting the mixer.
         self._number = None
+
+        # Process-local configuration, deliberately outside MusicContext.
+        self.spectrum_config = None
 
         # The name of the mixer this channel uses. Set below, as there's
         # no good default.
@@ -909,6 +958,23 @@ class Channel(object):
 
         return renpysound.get_pos(self.number)
 
+    def set_spectrum_enabled(self, enabled, fft_size, update_rate):
+        config = (fft_size, update_rate) if enabled else None
+        if not pcm_ok:
+            self.spectrum_config = config
+            return False
+        if not enabled and self._number is None:
+            self.spectrum_config = config
+            return not renpysound.is_webaudio and renpysound._spectrum_device_available()
+        supported = renpysound.set_spectrum_enabled(self.number, enabled, fft_size, update_rate)
+        self.spectrum_config = config
+        return supported
+
+    def get_spectrum(self):
+        if not pcm_ok or self.spectrum_config is None or self._number is None:
+            return None
+        return renpysound.get_spectrum(self._number)
+
     def get_duration(self):
         if not pcm_ok:
             return 0.0
@@ -1240,6 +1306,12 @@ def init():
                 pcm_ok = True
             except Exception:
                 pcm_ok = False
+
+    # Restore capture after device reconstruction, with fresh native history.
+    if pcm_ok:
+        for c in all_channels:
+            if c.spectrum_config is not None:
+                renpysound.set_spectrum_enabled(c.number, True, *c.spectrum_config)
 
     # Find all of the mixers in the game.
     mixers = []

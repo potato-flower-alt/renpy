@@ -32,7 +32,7 @@ cdef class TextureLoader:
     # All the texture number currently allocated by this loader.
     cdef set allocated
 
-    # A list of (number, generation) pairs for textures that need to be freed.
+    # Texture numbers to delete, or (number, pool key, size) entries to retire.
     cdef list free_list
 
     # The total size (in bytes) of all the textures that have been allocated
@@ -51,6 +51,13 @@ cdef class TextureLoader:
 
     cdef public GLfloat max_anisotropy
 
+    # Idle Live2D mask storage. Live GLTexture objects never enter this pool.
+    cdef object mask_pool
+    cdef object mask_pool_size
+    cdef object generation
+    cdef GLuint mask_fbo
+    cdef bint mask_fbo_failed
+
 
 cdef class GLTexture(GL2Model):
 
@@ -66,6 +73,10 @@ cdef class GLTexture(GL2Model):
 
     # The texture loader associated with this texture.
     cdef TextureLoader loader
+
+    cdef object generation
+    cdef object mask_pool_key
+    cdef object mask_storage_size
 
     # The width and height of the texture. (Which may be a different size
     # than the model, if the texture is being rendered in the drawable

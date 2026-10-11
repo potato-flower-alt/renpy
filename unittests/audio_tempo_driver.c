@@ -3,6 +3,76 @@
  * without adding a test-only API to Ren'Py. */
 #include "../src/ffmedia.c"
 
+/* A decoder underrun is temporary: it must not consume source time or turn
+ * into EOF. Exercise both the unity path and the tempo path without timing
+ * dependent thread sleeps. */
+static int check_audio_underrun(void) {
+    if (SDL_Init(0)) return 3;
+    MediaState ms = { 0 };
+    ms.lock = SDL_CreateMutex();
+    ms.cond = SDL_CreateCond();
+    ms.audio_duration = 44100;
+    ms.audio_end = -1;
+    short pcm[64];
+    int result = 0;
+
+    for (int speed = 0; speed < 2; speed++) {
+        ms.playback_speed = speed ? 1.5 : 1.0;
+        ms.audio_read_samples = 0;
+        ms.needs_decode = 0;
+        for (int ready = 1; ready >= 0; ready--) {
+            ms.ready = ready;
+            for (int i = 0; i < 2000; i++) {
+                int n = media_read_audio(&ms, (Uint8 *) pcm, sizeof(pcm));
+                if (n || ms.audio_read_samples || ms.audio_finished || media_audio_finished(&ms)) {
+                    fprintf(stderr, "Underrun consumed source audio: speed=%.1f ready=%d n=%d samples=%lld eof=%d\n",
+                        ms.playback_speed, ready, n, (long long) ms.audio_read_samples, ms.audio_finished);
+                    result = 10;
+                    goto done;
+                }
+            }
+        }
+        /* Buffered samples still play, and a partial read must not fill its
+         * missing half with silence or skip that half of the next frame. */
+        ms.ready = 1;
+        for (int pass = 0; pass < 2; pass++) {
+            AVFrame *frame = tempo_frame();
+            if (!frame) { result = 4; goto done; }
+            frame->nb_samples = 16;
+            if (av_frame_get_buffer(frame, 0) < 0) {
+                av_frame_free(&frame);
+                result = 4;
+                goto done;
+            }
+            for (int i = 0; i < 32; i++) ((short *) frame->data[0])[i] = 700 + pass;
+            enqueue_frame(&ms.audio_queue, frame);
+            ms.audio_queue_samples = 16;
+            int n = media_read_audio(&ms, (Uint8 *) pcm, sizeof(pcm));
+            if (n != 16 * BPS || ms.audio_read_samples != (pass + 1) * 16) {
+                fprintf(stderr, "Partial underrun skipped buffered samples.\n");
+                result = 11;
+                goto done;
+            }
+            for (int i = 0; i < 32; i++) {
+                if (pcm[i] != 700 + pass) { result = 12; goto done; }
+            }
+            for (int i = 0; i < 2000; i++) {
+                if (media_read_audio(&ms, (Uint8 *) pcm, sizeof(pcm)) ||
+                        ms.audio_read_samples != (pass + 1) * 16 || ms.audio_finished) {
+                    result = 13;
+                    goto done;
+                }
+            }
+        }
+    }
+
+done:
+    SDL_DestroyCond(ms.cond);
+    SDL_DestroyMutex(ms.lock);
+    SDL_Quit();
+    return result;
+}
+
 /* An EOF stream is retained for backward seeking. Repeated reads, including
  * underruns while its decoder is working, must not turn into wakeup polling. */
 static int check_tempo_idle(void) {
@@ -62,6 +132,7 @@ done:
 }
 
 int main(int argc, char **argv) {
+    if (argc == 2 && !strcmp(argv[1], "--underrun")) return check_audio_underrun();
     if (argc == 2 && !strcmp(argv[1], "--idle")) return check_tempo_idle();
     if (argc < 5) return 2;
     if (SDL_Init(0)) return 3;

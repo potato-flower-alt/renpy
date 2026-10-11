@@ -38,6 +38,21 @@ Empty reads and EOF must leave the tempo decoder asleep. The mixer tests also
 queue new audio after natural completion and seek backwards from EOF, checking
 that retaining an idle stream does not prevent playback from restarting.
 
+Unity-speed underrun regression (2026-10-05):
+
+- `audio_tempo_driver --underrun` constructs unready and empty decoder queues,
+  partial buffers, and resumed buffers at 1.0x and 1.5x. No sleeping or random
+  scheduling is needed to reproduce the defect.
+- Before the fix, an empty 1.0x queue with a known duration returned 128 silent
+  bytes and consumed 32 source samples. Repeated underruns could exhaust a
+  short voice before its decoded samples arrived.
+- Empty/partial reads now report only available samples, preserving the source
+  clock until decoding resumes. Padding after decoder EOF still honors known
+  or requested end times and movie lifetime. Clock mutations share the stream
+  lock with decoding and seek.
+- All 12 decoder tests passed with ASan, UBSan and leak detection, including
+  unchanged unity PCM, compressed audio, explicit padding and repeated seeks.
+
 Validation on 2026-09-24:
 
 - All 8 decoder tests passed under AddressSanitizer/UndefinedBehaviorSanitizer,

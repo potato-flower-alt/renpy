@@ -565,6 +565,14 @@ class Movie(renpy.display.displayable.Displayable):
     channel name is freed.
     """
 
+    def predict_shaders(self, shaders):
+        from renpy.gl2.gl2shadercache import predict_shader
+        predict_shader(shaders + ("renpy.texture",))
+        predict_shader(shaders + ("-renpy.texture", "renpy.movie_yuv"))
+        if self.mask or self.side_mask:
+            predict_shader(shaders + ("renpy.texture", "renpy.alpha_mask"))
+        return []
+
     @staticmethod
     def any_loadable(name):
         """
